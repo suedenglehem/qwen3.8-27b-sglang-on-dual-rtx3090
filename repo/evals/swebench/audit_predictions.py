@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Audit a SWE-bench predictions.jsonl + corresponding per-instance logs to
+classify each empty/short prediction as either:
+  - model_silent: model genuinely returned no source edit (real model behavior)
+  - infra_failure: server unreachable, model registry misconfigured,
+    UTF-8 decode crash, scaffold-side crash — NOT a model verdict and
+    should be re-rolled before scoring.
+
+Infrastructure failure patterns:
+  - `Connection error` / `connect ECONN` / `Connection refused`
+    → server unreachable
+  - `ProviderModelNotFoundError` / `Model not found: sglang/`
+    → opencode/claw scaffold-side model registry mismatch
+  - `assistant stream produced no content`
+    → claw saw nothing on the wire (server unresponsive)
+  - `UnicodeDecodeError`
+    → docker_rollout.py subprocess capture bug (fixed in commit fb13189)
+  - `HSAIL` / `RuntimeError: HIP error` / `CUDA error`
+    → GPU crash mid-roll
+  - `Internal Server Error` / `5\\d\\d ` HTTP errors
+    → SGLang returning 5xx
+  - Exit code != 0 from rollout subprocess
+  - rc=124 rows rolled before capture-at-wall (2026-10-08): the harness
+    never read /testbed at the wall, so the empty (or `ps`-echoed) patch is
+    a harness artefact, not the model's — `infra_wall_capture_defect`
+
+Output:
+  - `audit-report.json` next to predictions.jsonl
+  - text summary: total / model_silent / infra_failure with counts and
+    a per-instance reroll list
+  - optional `--write-reroll-list <path>` writes one instance_id per line
+    for `docker_rollout.py --instance-ids` resume
+
+Usage:
+    python evals/swebench/audit_predictions.py \\
+        --predictions evals/swebench/runs/<cell>/predictions.jsonl
+    python evals/swebench/audit_predictions.py \\
+        --predictions <path> --write-reroll-list /tmp/reroll.txt
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+# Two pattern tables (2026-09-03 rewrite — receipt in the qwen38 opencode lane):
+#
+# The per-instance log is "# stdout\n<scaffold event stream>\n# stderr\n<process
+# errors>". The scaffold's stdout EMBEDS the model's tool output — i.e. the
+# repository text it grep/cat'd. Scanning that for generic error shapes is
+# noise, not signal: the old catch-all `\b5\d{2}\b.*(error|Bad Gateway)` fired
+# on 147 of 249 *successful* (patched) runs ("Line 518: ... 'this is an
+# error'"), and bare `UnicodeDecodeError` / `ECONNRESET` / `Internal Server
+# Error` match Django, requests and Sphinx sources. Net: 24 of 31 planned
+# re-rolls were false positives — each one a free second attempt for the
+# model on a genuinely silent/timeout instance (upward cell bias).
+#
+# STDERR_PATTERNS: process-level shapes, trusted only in the stderr section.
+# ANYWHERE_PATTERNS: scaffold/API-error shapes that cannot occur in repo text
+# (node error strings, SDK error class names, JSON status fields); scanned in
+# both sections. Zero hits on 300 qwen38 logs; would have caught the
+# developer-role 400 case (opencode surfaces it as AI_APICallError).
+STDERR_PATTERNS = [
+    (r"Connection error", "connection_error"),
+    (r"Connection refused", "connection_error"),
+    (r"ECONNRESET", "connection_error"),
+    (r"socket hang up", "connection_error"),
+    (r"NetworkError", "connection_error"),
+    (r"UnicodeDecodeError", "rollout_unicode_bug"),
+    (r"HIP error", "gpu_crash"),
+    (r"CUDA error", "gpu_crash"),
+    (r"out of memory", "gpu_oom"),
+    (r"Internal Server Error", "server_500"),
+    (r"Bad Gateway|Service Unavailable|Gateway Time-?out", "server_5xx"),
+    (r"Read timed out", "client_timeout"),
+    # docker_rollout.py isolation prelude: the in-container loopback bridge
+    # could not reach the server (exit 97) — the scaffold never ran
+    (r"BRIDGE CHECK FAILED", "bridge"),
+    # docker run never started the scaffold (rc=125): the per-instance image
+    # vanished between build and run (janitor race, 2026-09-20) or the daemon
+    # refused the container. Re-roll rebuilds the image.
+    (r"Unable to find image '[^']*' locally", "rollout_image_missing"),
+    (r"docker: Error response from daemon", "docker_daemon"),
+]
+ANYWHERE_PATTERNS = [
+    (r"connect ECONN(REFUSED|RESET|ABORTED)", "connection_error"),
+    (r"ProviderModelNotFoundError", "scaffold_model_registry_mismatch"),
+    (r"Model not found: sglang/", "scaffold_model_registry_mismatch"),
+    (r"assistant stream produced no content", "server_empty_stream"),
+    (r"AI_APICallError|AI_RetryError|APICallError", "server_api_error"),
+    # opencode's AI SDK rejecting a tool-call delta with no id (SGLang emitted a
+    # tool_index=-1 argument delta for an orphan <parameter=/</function>;
+    # patch 063). The scaffold surfaces it as UnknownError and ends the session.
+    (r'"name":"UnknownError","data":\{"message":"Expected \'id\' to be a string',
+     "server_toolcall_stream_shape"),
+    (r"statusCode\"?\s*:\s*5\d\d", "server_5xx"),
+    (r"Request failed with status code 5\d\d", "server_5xx"),
+    (r"HSAIL 0x", "gpu_crash"),
+]
+# Back-compat alias (external callers / tests import this name).
+INFRA_PATTERNS = STDERR_PATTERNS + ANYWHERE_PATTERNS
+# A scaffold step that hit the output budget (see classify_log docstring).
+OUTPUT_BUDGET_RE = re.compile(r'"(?:reason|stopReason|finish_reason)"\s*:\s*"length"')
+
+
+def split_log_sections(log_text: str) -> tuple[str, str]:
+    """Return (stdout_section, stderr_section) of a docker_rollout per-instance log."""
+    i = log_text.rfind("\n# stderr\n")
+    if i < 0:
+        return log_text, ""
+    return log_text[:i], log_text[i + len("\n# stderr\n"):]
+
+
+DIFF_HEADS = ("diff ", "--- ", "Index: ")
+
+
+def classify_log(log_text: str, rollout_rc: int, patch: str, elapsed: float,
+                 patch_source: str | None = None) -> tuple[str, str | None]:
+    """Return (category, matched_pattern_or_None).
+
+    `patch_source` is the predictions.jsonl field docker_rollout.py writes
+    since capture-at-wall (2026-10-08): `stdout` (normal exit), `wall-exec`
+    (rc 124, patch read from the still-running container's /testbed),
+    `stdout-fallback` (the exec failed but the container had finished and
+    printed a real diff) or `wall-exec-failed`. Rows without the field were
+    rolled under the old convention.
+
+    Categories:
+      - real_diff: prediction has a non-empty patch
+      - model_silent: model returned no patch but ran normally (no infra error)
+      - model_output_budget: the session ended on a `length` finish — one
+        step (a think) filled the whole OUTPUT_BUDGET (32768) and the
+        scaffold ended the run there with nothing edited (opencode `run`
+        treats `length` as terminal; pi aborts the turn). A model verdict
+        on this budget, not infra: same combo overflows again on retry.
+        First seen qwen38 opencode v3 sympy-19254 (1/275; at the old 8K
+        cap this class was 62-69 % of qwen38's empties).
+      - model_timeout: scaffold agent hit the per-instance wall-clock cap
+        (rc=124, elapsed at/above the timeout boundary) and the tree was
+        clean when docker_rollout.py read it at the wall. This IS a model
+        verdict on the (model, scaffold, instance) tuple — same combo will
+        loop the same way on retry — so we keep it OUT of the reroll list to
+        avoid burning hours of doomed re-rolls. Cross-cycle data 2026-05-25
+        (4 cycles × 3 scaffolds): 81% of "infra" failures were this
+        pattern, zero chronic across runs, distributed by instance count
+        per repo. Counts toward the denominator as "model couldn't converge
+        in 1800s" — matrix accuracy preserved. A wall hit WITH edits on
+        disk is real_diff (capture-at-wall, 2026-10-08) — the row's
+        `model_timeout: true` keeps resolved-at-wall separable.
+      - infra_wall_capture_defect: rc=124 row whose patch was never read
+        from the tree — rolled before capture-at-wall (no `patch_source`),
+        or the wall-hit exec failed (`wall-exec-failed`). Empty by
+        construction (the in-script diff sits after the scaffold and its
+        cleanup pass), or a `ps`-echoed `=== DIFF ===` tail that is not a
+        diff. Re-rolled like any harness failure; a finished-inside-the-wall
+        row that already printed a real diff is kept as real_diff.
+      - infra_<sub>: matched an infrastructure failure pattern
+    """
+    if rollout_rc == 124 and patch_source not in ("wall-exec", "stdout-fallback"):
+        if (patch or "").lstrip().startswith(DIFF_HEADS):
+            return ("real_diff", None)
+        return ("infra_wall_capture_defect",
+                f"rc=124 patch_source={patch_source or 'pre-capture'} patch_len={len(patch or '')}")
+
+    has_patch = bool((patch or "").strip())
+    if has_patch:
+        return ("real_diff", None)
+
+    # Process-level shapes are trusted only in stderr; the stdout event stream
+    # embeds repo text the model read (see the pattern-table comment).
+    stdout_sec, stderr_sec = split_log_sections(log_text)
+    for pat, cat in STDERR_PATTERNS:
+        m = re.search(pat, stderr_sec, re.IGNORECASE)
+        if m:
+            return (f"infra_{cat}", m.group(0))
+    for pat, cat in ANYWHERE_PATTERNS:
+        m = re.search(pat, log_text, re.IGNORECASE)
+        if m:
+            return (f"infra_{cat}", m.group(0))
+
+    # GNU `timeout` exit code 124 + elapsed at/over the configured wall
+    # cap + empty patch = scaffold agent couldn't converge in budget.
+    # Treat as model verdict, not infra (see docstring above).
+    if rollout_rc == 124 and elapsed >= 1799:
+        return ("model_timeout", f"rc=124 elapsed={elapsed:.0f}s")
+
+    # Rollout subprocess died non-zero with no patch and no pattern
+    if rollout_rc not in (0, None):
+        return ("infra_rollout_nonzero_rc", f"rc={rollout_rc}")
+
+    # Clean exit, no edit, and the event stream shows a step that ran into
+    # the output budget (opencode step_finish `"reason":"length"`; pi
+    # `stopReason`/`finish_reason` length). stdout only: the model may read
+    # repo text, but this exact JSON shape is the scaffold's, not a file's.
+    m = OUTPUT_BUDGET_RE.search(stdout_sec)
+    if m:
+        return ("model_output_budget", m.group(0))
+
+    # Very fast empty completion suggests server returned 200 with empty content
+    # — could be model silence OR server returning empty body. Lacking a
+    # clearer signal, attribute to model.
+    if elapsed > 0 and elapsed < 5:
+        return ("model_silent_fast", None)
+
+    return ("model_silent", None)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--predictions", required=True,
+                    help="Path to predictions.jsonl")
+    ap.add_argument("--logs-dir", default=None,
+                    help="Path to per-instance logs dir (default: <pred>/../logs)")
+    ap.add_argument("--write-reroll-list", default=None,
+                    help="If set, write infra-failure instance_ids one per line to this path")
+    ap.add_argument("--write-report", default=None,
+                    help="Where to write the audit JSON (default: <pred>/../audit-report.json)")
+    args = ap.parse_args()
+
+    pred_path = Path(args.predictions).resolve()
+    if not pred_path.exists():
+        print(f"ERROR: predictions file not found: {pred_path}", file=sys.stderr)
+        return 2
+
+    run_dir = pred_path.parent
+    logs_dir = Path(args.logs_dir) if args.logs_dir else run_dir / "logs"
+    report_path = Path(args.write_report) if args.write_report else run_dir / "audit-report.json"
+
+    by_category: dict[str, list[dict]] = {}
+    reroll_ids: list[str] = []
+    total = 0
+
+    with pred_path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            total += 1
+            iid = d["instance_id"]
+            patch = d.get("model_patch", "") or ""
+            elapsed = d.get("rollout_seconds", 0)
+            rollout_rc = d.get("rollout_returncode")
+
+            log_path = logs_dir / f"{iid}.log"
+            log_text = ""
+            if log_path.exists():
+                try:
+                    log_text = log_path.read_text(errors="replace")
+                except OSError:
+                    pass
+
+            category, match = classify_log(log_text, rollout_rc, patch, elapsed,
+                                           d.get("patch_source"))
+            entry = {
+                "instance_id": iid,
+                "patch_len": len(patch),
+                "rollout_seconds": elapsed,
+                "rollout_rc": rollout_rc,
+                "matched": match,
+            }
+            by_category.setdefault(category, []).append(entry)
+            if category.startswith("infra_"):
+                reroll_ids.append(iid)
+
+    # Summary
+    print(f"\n=== {pred_path.relative_to(pred_path.parents[3]) if len(pred_path.parents) >= 4 else pred_path} ===")
+    print(f"  total predictions: {total}")
+    print(f"  real_diff:         {len(by_category.get('real_diff', []))}")
+    print(f"  model_silent:      {len(by_category.get('model_silent', []))}")
+    print(f"  model_silent_fast: {len(by_category.get('model_silent_fast', []))}  (elapsed < 5s, model returned empty fast)")
+    print(f"  model_output_budget: {len(by_category.get('model_output_budget', []))}  (a step hit the output budget; run ended unedited)")
+    print(f"  model_timeout:     {len(by_category.get('model_timeout', []))}  (rc=124 wall-clock cap, tree clean at the wall)")
+    infra_total = sum(len(v) for k, v in by_category.items() if k.startswith("infra_"))
+    print(f"  INFRA total:       {infra_total}")
+    for k, v in sorted(by_category.items()):
+        if k.startswith("infra_"):
+            print(f"    {k:40s} {len(v)}")
+    print(f"\n  → re-roll list size: {len(reroll_ids)} (these are NOT model verdicts; re-roll before scoring)")
+
+    if reroll_ids[:5]:
+        print(f"  → first 5: {reroll_ids[:5]}")
+
+    # Write report
+    report = {
+        "predictions_path": str(pred_path),
+        "total": total,
+        "real_diff": len(by_category.get("real_diff", [])),
+        "model_silent": len(by_category.get("model_silent", [])) + len(by_category.get("model_silent_fast", [])),
+        "model_output_budget": len(by_category.get("model_output_budget", [])),
+        "model_timeout": len(by_category.get("model_timeout", [])),
+        "infra_total": infra_total,
+        "by_category": {k: len(v) for k, v in sorted(by_category.items())},
+        "reroll_instance_ids": reroll_ids,
+        "infra_details": {k: v for k, v in sorted(by_category.items()) if k.startswith("infra_")},
+    }
+    report_path.write_text(json.dumps(report, indent=2))
+    print(f"\n  audit JSON: {report_path}")
+
+    if args.write_reroll_list:
+        Path(args.write_reroll_list).write_text("\n".join(reroll_ids) + ("\n" if reroll_ids else ""))
+        print(f"  reroll list (one ID per line): {args.write_reroll_list}")
+
+    return 0 if infra_total == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

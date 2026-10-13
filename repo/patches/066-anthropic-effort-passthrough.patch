@@ -1,0 +1,42 @@
+diff --git a/python/sglang/srt/entrypoints/anthropic/protocol.py b/python/sglang/srt/entrypoints/anthropic/protocol.py
+index a79952e..f4d4da0 100644
+--- a/python/sglang/srt/entrypoints/anthropic/protocol.py
++++ b/python/sglang/srt/entrypoints/anthropic/protocol.py
+@@ -328,8 +328,8 @@ class AnthropicTaskBudget(BaseModel):
+ class AnthropicOutputConfig(BaseModel):
+     """Claude 4.7 ``output_config`` block.
+ 
+-    ``effort`` maps to the OpenAI ``reasoning_effort`` knob (``xhigh`` →
+-    ``max`` because the OpenAI Literal does not include ``xhigh``).
++    ``effort`` maps to the OpenAI ``reasoning_effort`` knob unchanged; each chat
++    template owns its accepted subset of the effort vocabulary.
+     ``task_budget`` is propagated as a custom-param hint.
+     """
+ 
+diff --git a/python/sglang/srt/entrypoints/anthropic/serving.py b/python/sglang/srt/entrypoints/anthropic/serving.py
+index b20bbdb..2d0a7c2 100644
+--- a/python/sglang/srt/entrypoints/anthropic/serving.py
++++ b/python/sglang/srt/entrypoints/anthropic/serving.py
+@@ -621,17 +621,17 @@ class AnthropicServing:
+             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
+ 
+         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
+-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
+-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
++        # ``reasoning_effort`` knob unchanged — ReasoningEffortTier already
++        # spells every Anthropic value, and each chat template owns its accepted
++        # subset (Qwen3.8's raises on anything outside xhigh/medium/low/max).
++        # Rewriting xhigh to max here turned that template's top tier into a 500.
+         # ``task_budget`` is a soft hint forwarded as a custom param so the
+         # model can see it without it becoming a hard cap (``max_tokens``
+         # is still the hard cap).
+         if anthropic_request.output_config is not None:
+             oc = anthropic_request.output_config
+             if oc.effort is not None:
+-                chat_request.reasoning_effort = (
+-                    "max" if oc.effort == "xhigh" else oc.effort
+-                )
++                chat_request.reasoning_effort = oc.effort
+             if oc.task_budget is not None:
+                 # Custom params are silently ignored by backends that
+                 # don't recognise them; logging it makes the propagation

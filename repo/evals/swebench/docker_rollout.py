@@ -1,0 +1,1562 @@
+#!/usr/bin/env python3
+"""Docker-backed rollout: a coding-agent scaffold runs INSIDE a swebench
+instance container. Same env as the official scoring harness (Python
+3.6/3.8/3.9/..., conda testbed activated, all system deps installed) —
+the model can run pytest mid-iteration against the actual environment
+its fix will be graded in.
+
+Per-instance flow:
+  1. Pull the upstream eval image  swebench/sweb.eval.x86_64.<normalized>:latest
+     (instance_id with __ -> _1776_ per the swebench tag convention).
+  2. Build a rollout image  swebench-rollout/<instance_id>:latest  by adding
+     Node + opencode + little-coder + ripgrep on top of the eval image
+     (Dockerfile.rollout). claw-code lives in Dockerfile.rollout-claw
+     because of its Rust build + Anthropic-proxy requirement.
+  3. Run a container with --network none (default) — the only reachable
+     address is the SGLang server at 127.0.0.1:<port>, forwarded through
+     net_bridge.py over a bind-mounted unix socket; /testbed's git history is re-initialised to
+     HEAD first. Working directory is /testbed (already cloned +
+     conda-activated by the upstream eval image). `--network-mode host` is
+     the pre-2026-09-19 behaviour (exposure-confounded; study cells only).
+  4. Exec the scaffold against the problem statement; capture the resulting
+     `git diff` as the prediction patch.
+  5. Append to predictions.jsonl in the v1 schema + a `rollout_scaffold`
+     field so downstream tools can group by scaffold.
+
+Per-(model, scaffold) results are isolated to their own output dir so
+predictions, logs, and scores never collide across scaffolds:
+
+    evals/swebench/runs/<preset>-<scaffold>-v2/
+        predictions.jsonl                # rollout output
+        predictions/<inst>.diff
+        logs/<inst>.log
+        scores-docker.jsonl              # filled by score_docker.py
+        meta.json                        # scaffold + model + run metadata
+
+Usage:
+    python evals/swebench/docker_rollout.py \\
+        --model sglang/coder-30b-eval \\
+        --scaffold opencode \\
+        --out evals/swebench/runs/coder-30b-opencode-v2 \\
+        --skip-existing
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+THIS_DIR = Path(__file__).resolve().parent
+DOCKERFILE = THIS_DIR / "docker" / "Dockerfile.rollout"
+DOCKER_CTX = THIS_DIR / "docker"
+
+
+# claw-code DEPRECATED 2026-08-30 (unmaintained; kept for reproducing
+# historical cells — R9700 retired it the same day). opencode-dcp = opencode
+# with the Dynamic Context Pruning plugin (isolated HOME, see Dockerfile).
+SUPPORTED_SCAFFOLDS = ("opencode", "opencode-dcp", "little-coder", "little-coder-rtk", "claw-code", "prime", "dcode")
+
+# --- scaffold pins ------------------------------------------------------------
+# A cell is ONE scaffold version end to end. Every row and meta.json run record
+# carries `scaffold_pin` (derived from the Dockerfile ARGs, so it cannot drift
+# from the image) and a resume (--skip-existing, Phase-4 re-roll) refuses a
+# cell whose rows ran under a different pin — a changed pin is a NEW cell; the
+# old one gets a quarantine suffix (`-pi068`, 2026-10-09). The little-coder
+# lanes name the pi backend the npm pin bundles (verified inside the image).
+LITTLE_CODER_PI = {
+    "1.1.0": "@mariozechner/pi-coding-agent@0.68.1",
+    "1.19.0": "@earendil-works/pi-coding-agent@0.83.0",
+}
+# Rows written before 2026-10-09 carry no scaffold_pin: what those lanes ran.
+# Only little-coder changed — the control lane was the global 1.1.0 install
+# until the R9700 ask (154ef56) re-pinned it to the rtk lane's 1.19.0 prefix so
+# the RTK A/B stops being a pi-0.68-vs-0.83 comparison. Every other scaffold's
+# legacy pin is its current one.
+LEGACY_SCAFFOLD_PINS = {"little-coder": "little-coder@1.1.0/@mariozechner/pi-coding-agent@0.68.1"}
+
+
+def dockerfile_args() -> dict[str, str]:
+    """`ARG NAME=VALUE` pins from Dockerfile.rollout (trailing comments dropped)."""
+    out = {}
+    for line in DOCKERFILE.read_text().splitlines():
+        m = re.match(r"^ARG\s+([A-Z_]+)=(\S+)", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def scaffold_pin(scaffold: str) -> str:
+    """The version pin a lane's rows carry (see the section comment above)."""
+    a = dockerfile_args()
+    lc_ver = a["LITTLE_CODER_RTK_VERSION"]   # both little-coder lanes run the /opt/lc-rtk prefix
+    lc = f"little-coder@{lc_ver}/{LITTLE_CODER_PI.get(lc_ver, 'pi-coding-agent@unverified')}"
+    return {
+        "opencode": f"opencode-ai@{a['OPENCODE_VERSION']}",
+        "opencode-dcp": f"opencode-ai@{a['OPENCODE_VERSION']}+opencode-dcp@{a['OPENCODE_DCP_VERSION']}",
+        "little-coder": lc,
+        "little-coder-rtk": f"{lc}+rtk@{a['RTK_VERSION']}",
+        "prime": f"prime-agent@{a['PRIME_AGENT_VERSION']}",
+        "dcode": f"deepagents-code@{a['DCODE_VERSION']}",
+        "claw-code": "claw-code@retired-2026-08-30",
+    }[scaffold]
+
+
+def check_cell_pin(predictions_path: Path, scaffold: str) -> tuple[bool, str]:
+    """(ok, message) — ok when every existing row of the cell ran under the pin
+    this code rolls for `scaffold` (rows without the field count as the legacy
+    pin). Called before any resume touches the file (docker_rollout.py
+    --skip-existing; reroll_infra_failures.py BEFORE it strips)."""
+    want = scaffold_pin(scaffold)
+    legacy = LEGACY_SCAFFOLD_PINS.get(scaffold, want)
+    seen: dict[str, int] = {}
+    for line in predictions_path.read_text().splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        pin = d.get("scaffold_pin") or legacy
+        seen[pin] = seen.get(pin, 0) + 1
+    bad = {pin: n for pin, n in seen.items() if pin != want}
+    if bad:
+        return False, (f"SCAFFOLD PIN MISMATCH: {predictions_path} holds {bad} rows but this code rolls "
+                       f"{want!r} — a changed pin is a new cell: rename the old dir with a quarantine "
+                       f"suffix and roll fresh (never mix pins inside one predictions.jsonl)")
+    return True, f"scaffold pin {want!r} ({sum(seen.values())} existing rows match)"
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True,
+                   help="Scaffold-side model id. opencode/little-coder format: "
+                        "<provider>/<served-name>. Examples: sglang/coder-30b-eval, "
+                        "openai/coder-30b-eval. Provider is opaque to the rollout — "
+                        "just controls the scaffold's request routing.")
+    p.add_argument("--scaffold", default="opencode", choices=SUPPORTED_SCAFFOLDS,
+                   help="Which agent scaffold to invoke inside the container.")
+    p.add_argument("--dataset", default="princeton-nlp/SWE-bench_Lite",
+                   help="HF dataset id (Lite=300, Verified=500)")
+    p.add_argument("--split", default="test")
+    p.add_argument("--instances", type=int, default=0,
+                   help="Limit to first N instances (0 = all)")
+    p.add_argument("--instance-ids", nargs="*", default=None,
+                   help="Specific instance IDs to run (overrides --instances)")
+    p.add_argument("--out", required=True,
+                   help="Output dir for predictions + logs (per-scaffold convention: "
+                        "evals/swebench/runs/<preset>-<scaffold>-v2/)")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="Per-instance scaffold timeout (seconds). v2 opencode "
+                        "distribution: p50=121s, p90=210s, p99=1014s, max=1328s — "
+                        "1800s catches all but pathological cases. little-coder + "
+                        "claw-code default to the same ceiling pending real data.")
+    p.add_argument("--server-url", default="http://127.0.0.1:23334",
+                   help="SGLang server base URL (used for preflight)")
+    p.add_argument("--served-name", default=None,
+                   help="Served model name (defaults to model id after slash)")
+    p.add_argument("--context-window", type=int, default=0,
+                   help="Token budget every scaffold is told the model has. 0 (default) "
+                        "= read max_model_len from the server's /v1/models so the "
+                        "scaffold budget always equals the served KV window. Found "
+                        "2026-09-11: little-coder's pi ran every preset at a 32,768 "
+                        "fallback (unknown model id -> first packaged models.json "
+                        "entry), prime-agent defaulted to 128K, dcode to a 170K "
+                        "summarization trigger, and opencode.json carried 32K for "
+                        "several presets. Budget is now injected per run (see "
+                        "build_scaffold_invocation) and recorded in meta.json.")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip instances that already have a prediction")
+    p.add_argument("--max-empty-streak", type=int, default=10,
+                   help="Abort after this many consecutive empty diffs")
+    p.add_argument("--network-mode", default="none", choices=("none", "host"),
+                   help="Rollout container network. `none` (default) = no network; the "
+                        "scaffold reaches the server through a loopback bridge over a "
+                        "bind-mounted unix socket (net_bridge.py) and release tags / "
+                        "non-HEAD refs are stripped from the work tree. `host` = the "
+                        "pre-2026-09-19 configuration (answer leakage: webfetch/curl "
+                        "reach GitHub) — exposure studies only.")
+    p.add_argument("--keep-containers", action="store_true",
+                   help="Don't `docker rm` after each instance (debug)")
+    p.add_argument("--no-pull", action="store_true",
+                   help="Skip `docker pull` of the upstream eval image (use only if "
+                        "already cached locally; otherwise the build will fail)")
+    p.add_argument("--rebuild-image", action="store_true",
+                   help="Force `docker build` even when the rollout image already "
+                        "exists. Use after Dockerfile.rollout changes (e.g. adding "
+                        "a new scaffold) so the layered binaries are present.")
+    return p.parse_args()
+
+
+# Activate the SWE-bench `testbed` conda env EXPLICITLY inside the container
+# script. `bash -lc` only reaches `conda activate testbed` through
+# /root/.bashrc; the lanes that override HOME for config isolation
+# (opencode-dcp -> /opt/dcp-home, little-coder-rtk -> /opt/rtk-home) skipped it
+# and ran the scaffold on the miniconda BASE interpreter while the prompt
+# promised the repo env. qwen38 receipts (2026-09-07): "No module named
+# <repo>" in 34% of DCP sessions vs 10% opencode control; env-hunting in 85%
+# of RTK ledgers; 5 timeouts in the first 40 RTK instances vs 0 control.
+# Idempotent for HOME=/root lanes (same env the login shell already gave).
+ACTIVATE_TESTBED = (
+    "if [ -f /opt/miniconda3/etc/profile.d/conda.sh ]; then\n"
+    "  source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed\n"
+    "fi\n"
+)
+
+
+# Uniform per-request output budget for every scaffold. Thinking models emit
+# long reasoning traces: opencode's packaged `limit.output: 8192` truncated
+# 38 of 293 qwen38 opencode sessions, 35 of which ended as empty patches (69%
+# of that cell's empties; 62% on the DCP lane), pi's 16384 hit the cap 29x
+# in the first 250 little-coder sessions. Must EQUAL each scaffold's compaction
+# reserve: SGLang 400s any request whose prompt + max_tokens exceeds the served
+# window (presets deliberately don't pass --allow-auto-truncate, which would
+# also silently truncate over-long prompts), so the scaffold has to compact
+# before the prompt reaches window - OUTPUT_BUDGET.
+OUTPUT_BUDGET = 32768
+# What the wire actually carries: pi-ai 0.68 (little-coder 1.1.0) and
+# prime-agent clamp `Math.min(model.maxTokens, 32000)` in simple-options.js;
+# the current @earendil-works pi (rtk lane) and opencode send OUTPUT_BUDGET
+# as-is. scaffold_request_audit.py checks caps against this floor.
+OUTPUT_CAP_FLOOR = 32000
+
+# Thinking policy: every scaffold runs the model at its MAXIMUM thinking
+# tier. No scaffold may send `reasoning_effort` (pi's default "medium"
+# halved qwen38's budget; pi also clamps xhigh->high, which the Qwen3.8
+# template rejects) or `enable_thinking: false`. Sending nothing lets the
+# served chat template's default apply — the preset owns that default
+# (Qwen3.8 -> xhigh, Qwen3.5/3.6 -> on; gemma4 presets pass
+# --default-chat-template-kwargs). scaffold_request_audit.py asserts this.
+
+
+# Server credential. Bare-metal serving (SERVE_MODE=bare in run_model_cycle.sh)
+# runs without --api-key and every scaffold sends a placeholder; serving from
+# the OCI image (SERVE_MODE=docker) goes through secure-launch, which requires
+# an API key, so serve_backend.sh mints one per cycle and points
+# SWEBENCH_API_KEY_FILE at it. The same value is handed to every scaffold's
+# provider config and used by our own preflight / model-card reads.
+API_KEY_PLACEHOLDER = "noop"
+
+
+def api_key() -> str:
+    path = os.environ.get("SWEBENCH_API_KEY_FILE")
+    if path:
+        with open(path) as fh:
+            key = fh.readline().strip()
+        if not key:
+            raise ValueError(f"SWEBENCH_API_KEY_FILE={path} is empty")
+        return key
+    return os.environ.get("SWEBENCH_API_KEY") or API_KEY_PLACEHOLDER
+
+
+def api_auth_enabled() -> bool:
+    return api_key() != API_KEY_PLACEHOLDER
+
+
+def _auth_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if api_auth_enabled():
+        h["Authorization"] = f"Bearer {api_key()}"
+    return h
+
+
+def _pi_settings_snippet(agent_dir: str) -> str:
+    """Shell lines that merge `compaction.reserveTokens = OUTPUT_BUDGET` into
+    a pi-family global settings.json (pi-coding-agent / prime-agent both
+    default 16384: compaction fires at contextWindow - reserveTokens, so the
+    reserve must cover the request's max_completion_tokens or the server
+    rejects the turn). `agent_dir` is a shell expression ($HOME/.pi/agent,
+    /root/.prime/agent)."""
+    js = (
+        'const fs=require("fs");const d=process.argv[1];const p=d+"/settings.json";'
+        'fs.mkdirSync(d,{recursive:true});'
+        'let s={};try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){}'
+        f's.compaction=Object.assign({{}},s.compaction||{{}},{{reserveTokens:{OUTPUT_BUDGET}}});'
+        'fs.writeFileSync(p,JSON.stringify(s,null,2));'
+        'console.error("context budget: "+p+" compaction="+JSON.stringify(s.compaction));'
+    )
+    return f"node -e '{js}' \"{agent_dir}\"\n"
+
+
+def _opencode_budget_snippet(served_name: str, context_window: int) -> str:
+    """Shell lines that pin `provider.sglang.models[<served>].limit.context`
+    in the lane's ~/.config/opencode/opencode.json to the served window
+    (adding the entry if the preset is missing — the old "new preset needs
+    an opencode.json entry + image nuke" landmine), `limit.output` to
+    OUTPUT_BUDGET (opencode sends max_tokens = min(limit.output,
+    OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX) and auto-compacts at
+    limit.context - that) and the provider apiKey to the server credential
+    (see api_key). HOME-relative, so the DCP lane's /opt/dcp-home copy is
+    the one edited there."""
+    js = (
+        'const fs=require("fs");const p=process.env.HOME+"/.config/opencode/opencode.json";'
+        'const d=JSON.parse(fs.readFileSync(p,"utf8"));const m=d.provider.sglang.models;'
+        f'const id={json.dumps(served_name)};const e=m[id]||(m[id]={{name:id,tool_call:true}});'
+        f'e.limit=Object.assign({{}},e.limit||{{}},{{context:{int(context_window)},output:{OUTPUT_BUDGET}}});'
+        f'd.provider.sglang.options.apiKey={json.dumps(api_key())};'
+        'fs.writeFileSync(p,JSON.stringify(d,null,2));'
+        'console.error("context budget: opencode.json "+id+" limit="+JSON.stringify(e.limit));'
+    )
+    return f"node -e '{js}'\n"
+
+
+def _little_coder_budget_snippet(pkg_root: str, served_name: str, context_window: int) -> str:
+    """Shell lines that write a per-run little-coder models file declaring the
+    served model under the llamacpp provider (copying the packaged provider's
+    api/baseUrl) and export LITTLE_CODER_MODELS_FILE so both little-coder
+    1.1.0 and 1.19.0 load it (provider-level merge over the packaged file).
+    Without it pi's model resolver clones the first packaged entry: 32K.
+    The provider apiKey is written as the literal credential: the packaged
+    value is the env-var NAME `LLAMACPP_API_KEY`, which pi 0.68 (1.1.0)
+    resolves through the environment but the current @earendil-works pi
+    (1.19.0, rtk lane) sends verbatim — `Bearer LLAMACPP_API_KEY` on the
+    wire (caught by scaffold_request_audit.py's auth check, 2026-09-19).
+    `compat.supportsReasoningEffort:false` keeps pi from sending its default
+    `reasoning_effort: medium` (see the thinking policy above); maxTokens and
+    the settings.json compaction reserve are both OUTPUT_BUDGET."""
+    js = (
+        f'const fs=require("fs");const pkg=JSON.parse(fs.readFileSync({json.dumps(pkg_root + "/models.json")},"utf8"));'
+        f'const prov=pkg.providers.llamacpp;const id={json.dumps(served_name)};'
+        f'prov.apiKey={json.dumps(api_key())};'
+        f'prov.models=[{{id:id,name:id+" (SGLang, served window)",reasoning:true,input:["text"],'
+        f'contextWindow:{int(context_window)},maxTokens:{OUTPUT_BUDGET},cost:{{input:0,output:0,cacheRead:0,cacheWrite:0}},'
+        'compat:{supportsReasoningEffort:false}}];'
+        'fs.writeFileSync("/tmp/sweb-little-coder-models.json",JSON.stringify({providers:{llamacpp:prov}},null,2));'
+        'console.error("context budget: little-coder models.json "+id+" contextWindow="+prov.models[0].contextWindow);'
+    )
+    return (f"node -e '{js}'\nexport LITTLE_CODER_MODELS_FILE=/tmp/sweb-little-coder-models.json\n"
+            + _little_coder_profile_snippet(pkg_root, served_name, context_window)
+            + _pi_settings_snippet("$HOME/.pi/agent"))
+
+
+# little-coder per-model profile pinned for the served model (R9700 finding,
+# their commit 96a61f5, 2026-09-13; verified in both of our prefixes). The
+# package's benchmark-profiles extension resolves `little_coder.model_profiles`
+# from the PACKAGE's own .pi/settings.json (exact key, then prefix, then
+# `default_model_profile`); an unknown served model gets the default profile:
+# 1.1.0 = thinking_budget 2048 / context_limit 32768 / temperature 0.3,
+# 1.19.0 = thinking_budget 4096 / temperature 0.3. The thinking-budget
+# extension counts thinking_delta chars/3.5 and on breach ABORTS the turn,
+# flips pi's thinking level to "off" (which only drops `reasoning_effort` —
+# we never send it, so the template keeps thinking at its default) and queues
+# "[thinking budget exceeded] Please commit to an implementation now" — at
+# xhigh that is an abort->nudge loop until the rollout timeout (R9700: 3258
+# iterations in 90 s on a ~6K-token thinking stream). The profile beats
+# LITTLE_CODER_THINKING_BUDGET (profile || env || default), so pinning the
+# key is the only lever. No `temperature`: the extension then injects
+# nothing and SGLang applies the checkpoint's generation_config, the same
+# sampling every other lane gets (lanes before 2026-09-13 ran at T=0.3).
+LC_MODEL_PROFILE = {
+    "max_tokens": OUTPUT_BUDGET,   # informational; the wire cap is models.json maxTokens
+    "thinking_budget": 1000000,    # never trips the abort (server-bound instead)
+    "skill_token_budget": 300,     # unchanged package defaults from here down
+    "knowledge_token_budget": 200,
+    "system_prompt_budget": 0,
+    "max_retries": 1,
+}
+
+
+def _little_coder_profile_snippet(pkg_root: str, served_name: str, context_window: int) -> str:
+    """Shell lines that pin `little_coder.model_profiles["llamacpp/<served>"]`
+    in the package's .pi/settings.json (see LC_MODEL_PROFILE). The image is
+    rebuilt per instance, so this runs on every rollout; the file lives inside
+    the npm package (an upgrade drops it)."""
+    prof = dict(LC_MODEL_PROFILE, context_limit=int(context_window))
+    js = (
+        f'const fs=require("fs");const p={json.dumps(pkg_root + "/.pi/settings.json")};'
+        'const d=JSON.parse(fs.readFileSync(p,"utf8"));const lc=d.little_coder||(d.little_coder={});'
+        f'const mp=lc.model_profiles||(lc.model_profiles={{}});const k="llamacpp/"+{json.dumps(served_name)};'
+        f'mp[k]={json.dumps(prof, separators=(",", ":"))};'
+        'fs.writeFileSync(p,JSON.stringify(d,null,2)+"\\n");'
+        'console.error("context budget: little-coder model profile "+k+" "+JSON.stringify(mp[k]));'
+    )
+    return f"node -e '{js}'\n"
+
+
+# --- network isolation -------------------------------------------------------
+# 2026-09-19: with `--network=host` the scaffolds' web tools and bash network
+# reached the upstream fix — 54 % of qwen38 opencode instances exposed, 21 %
+# fetched their own PR diff (benchmarks/quality/swebench-leak-audit-qwen38-
+# netopen-2026-09-19.md; R9700 found 45–61 % on their lanes first). The
+# container now runs with no network; only 127.0.0.1:<server port> works,
+# through net_bridge.py over a unix socket the host half forwards to SGLang.
+BRIDGE_SOCK_IN_CONTAINER = "/run/bridge.sock"   # neutral: the path shows in `ps` (bridge argv) and mountinfo
+BRIDGE_SCRIPT_IN_CONTAINER = "/sandbox/net_bridge.py"
+# Every scaffold config in the image points at 127.0.0.1:23334 (opencode.json,
+# the pi models files, OPENAI_BASE_URL for prime/dcode). The container half of
+# the bridge always binds that port; the host half forwards to --server-url,
+# so the host may serve from any port (docker-mode SGLang, a capture server).
+CONTAINER_SERVER_PORT = 23334
+# the images' base python (modern, has asyncio unix sockets); the testbed env
+# may be python 3.5 on old django instances
+CONTAINER_PY = "/opt/miniconda3/bin/python3"
+_BRIDGE_PROC = None
+
+
+def start_host_bridge(server_url: str) -> Path:
+    """Host half of the bridge: unix socket -> server TCP. Lives for the run
+    (PDEATHSIG so a SIGKILLed lane does not leave a listener on a dead socket)."""
+    global _BRIDGE_PROC
+    import atexit
+    from urllib.parse import urlparse
+    u = urlparse(server_url)
+    port = u.port or 80
+    run_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    if not run_dir.is_dir():
+        run_dir = Path("/tmp")
+    sock = run_dir / f"bridge-{os.getpid()}.sock"  # unix paths cap at ~107 bytes; neutral name (mountinfo)
+
+    def _die_with_parent():
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15)  # PR_SET_PDEATHSIG, SIGTERM
+        except Exception:
+            pass
+
+    _BRIDGE_PROC = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve().parent / "net_bridge.py"),
+         "host", str(sock), u.hostname or "127.0.0.1", str(port)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        preexec_fn=_die_with_parent,
+    )
+    for _ in range(50):
+        if sock.exists():
+            break
+        time.sleep(0.1)
+    if not sock.exists():
+        raise RuntimeError("network bridge socket did not appear (net_bridge.py host)")
+
+    def _stop():
+        if _BRIDGE_PROC and _BRIDGE_PROC.poll() is None:
+            _BRIDGE_PROC.kill()
+        try:
+            sock.unlink()
+        except FileNotFoundError:
+            pass
+    atexit.register(_stop)
+    return sock
+
+
+def network_docker_args(network_mode: str, bridge_sock: Path | None, stage: Path) -> list[str]:
+    """docker-run arguments for the chosen network mode plus the per-instance
+    session-store mount every mode gets (audit_leakage.py reads it). Every
+    bind source lives under the neutral staging dir (see stage_instance_mounts)."""
+    args = ["--mount", f"type=bind,src={stage / 'sessions'},dst=/sessions"]
+    if network_mode == "host":
+        return ["--network=host", *args]
+    return [
+        "--network", "none",
+        "--mount", f"type=bind,src={stage / 'bridge.py'},dst={BRIDGE_SCRIPT_IN_CONTAINER},readonly",
+        "--mount", f"type=bind,src={bridge_sock},dst={BRIDGE_SOCK_IN_CONTAINER}",
+        *args,
+    ]
+
+
+# --- harness-owned cue hygiene (2026-09-20, after R9700's benchmark-recall
+# finding) ------------------------------------------------------------------
+# /proc/self/mountinfo inside the container prints the HOST source path of
+# every bind mount (`mount` and `df` do not). Mounting straight from
+# evals/swebench/runs/<preset>-<scaffold>-v3/{sessions,logs}/<iid>... handed
+# the sandbox the benchmark name, the instance id, the model and the scaffold
+# in one `cat`. So every per-instance bind source is staged under a neutral
+# temp dir (/var/tmp/rs-XXXX: prompt.md, bridge.py with docstring + comments
+# stripped, an empty sessions/), moved back to <run>/sessions/<iid> after the
+# container exits, and the docker command line is refused if any mount source
+# or the inner script still names the benchmark or the instance. The cues the
+# official sweb.eval image itself carries (/testbed, its "SWE-bench" HEAD
+# commit + /root/.gitconfig) are left alone on purpose: those are the shared
+# cue set both rigs' matrices run under.
+STAGE_ROOT = Path("/var/tmp")
+CUE_RE = re.compile(r"swe[-_ ]?bench", re.I)
+
+
+def strip_python_source(src: str) -> str:
+    """Drop the module/function docstrings and every comment (ast round-trip)."""
+    import ast
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                body.pop(0)
+                if not body:
+                    body.append(ast.Pass())
+    return ast.unparse(tree) + "\n"
+
+
+def stage_instance_mounts(prompt: str) -> Path:
+    """Create the neutral per-instance staging dir with the bind sources."""
+    import tempfile
+    stage = Path(tempfile.mkdtemp(prefix="rs-", dir=STAGE_ROOT))
+    (stage / "sessions").mkdir()
+    (stage / "prompt.md").write_text(prompt)
+    here = Path(__file__).resolve().parent
+    (stage / "bridge.py").write_text(strip_python_source((here / "net_bridge.py").read_text()))
+    os.chmod(stage, 0o755)
+    return stage
+
+
+def collect_stage(stage: Path, sessions_dir: Path) -> None:
+    """Move the session snapshot to its audited home and drop the staging dir."""
+    if sessions_dir.exists():
+        shutil.rmtree(sessions_dir, ignore_errors=True)   # a re-roll replaces the old snapshot
+    sessions_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(stage / "sessions"), str(sessions_dir))
+    except Exception as e:  # noqa: BLE001 — root-owned leftovers when the snapshot step never ran
+        print(f"  ! session snapshot not collected ({type(e).__name__}: {e}); left at {stage}", flush=True)
+        return
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def assert_no_harness_cues(cmd: list[str], iid: str) -> None:
+    """Refuse a docker command whose mount sources, env values or inner script
+    name the benchmark or the instance (the prompt text travels by file, so
+    only the problem statement itself can legitimately carry either)."""
+    hits = []
+    for i, a in enumerate(cmd):
+        if a in ("--name", "--workdir") or (i and cmd[i - 1] in ("--name",)):
+            continue   # container name is host-side only (hostname = container id)
+        if a.startswith("type=bind,src="):
+            src = a.split("src=", 1)[1].split(",", 1)[0]
+            if CUE_RE.search(src) or iid in src:
+                hits.append(f"mount source {src}")
+        elif i and cmd[i - 1] == "-v":
+            src = a.split(":", 1)[0]
+            if CUE_RE.search(src) or iid in src:
+                hits.append(f"mount source {src}")
+        elif i and cmd[i - 1] == "--env":
+            if CUE_RE.search(a) or iid in a:
+                hits.append(f"env {a.split('=', 1)[0]}")
+    inner = cmd[-1]
+    if CUE_RE.search(inner) or iid in inner:
+        hits.append("inner script (visible in `ps` for the whole run)")
+    if hits:
+        raise RuntimeError("harness cue would reach the sandbox: " + "; ".join(hits))
+
+
+def isolation_prelude(network_mode: str, port: int = CONTAINER_SERVER_PORT) -> str:
+    """Shell that runs before the scaffold: bring up the loopback bridge and
+    prove the server is reachable through it (exit 97 = infra, never a model
+    verdict), then re-initialise /testbed's git history to ONE commit holding
+    exactly the original tracked set, authored `eval <eval@local>`.
+
+    That replaces the earlier ref strip (tags / non-HEAD branches / remotes):
+    the official sweb.eval image's HEAD is a commit *by* `SWE-bench
+    <setup@swebench.com>` *titled* `SWE-bench` (reflog too), so the first
+    `git log` told the model which benchmark it was in — and R9700's recall
+    audit (2026-09-20) put 17 of 19 wall hits in sessions naming the benchmark
+    30+ times. Their sandbox re-inits the tree the same way (1 commit,
+    eval@local), so the two matrices share the residual cue set: `/testbed`,
+    the `testbed` conda env, the issue text and the prompt's "Do not modify
+    tests" line. `git ls-files` + `add -f --pathspec-from-file` keeps the
+    tracked set bit-identical (no .gitignore drift: audit_leakage.py gates on
+    `dirty=` equalling `dirty_before=` on the `isolation: git=` line —
+    `dirty_before` is the image's own `git status --porcelain` count, 0 for
+    every Lite image except psf__requests-863, which ships an untracked,
+    un-ignored `build/`). Whatever the image already had untracked is written
+    to the new store's `.git/info/exclude` (anchored, glob-escaped) together
+    with the image's own exclude file, so the `git add -A` diff capture never
+    sweeps image residue into the patch — requests-863's `build/` made an
+    874 KB patch that apply-failed at scoring in 26/32 cells (2026-09-22 to
+    2026-10-08). The line reports `excluded=K`; the gate accepts
+    `dirty + excluded == dirty_before`. ~1.5 s on django. Release tags, other
+    branches and remotes go with the old store, so the ref-strip guarantee is
+    preserved (refs=1 tags=0)."""
+    strip = (
+        "git config --global --add safe.directory /testbed 2>/dev/null || true\n"
+        # one status pass: the dirty count AND the untracked baseline (-z, so
+        # no porcelain quoting; `?? path` -> `/path` with glob chars escaped)
+        "git -C /testbed status --porcelain -z | tr '\\0' '\\n' > /tmp/.status0\n"
+        "DIRTY0=$(wc -l < /tmp/.status0)\n"
+        "sed -n 's/^?? //p' /tmp/.status0 | sed 's/[][*?\\\\]/\\\\&/g; s/^/\\//' > /tmp/.exclude0\n"
+        "cat /testbed/.git/info/exclude > /tmp/.exclude1 2>/dev/null || : > /tmp/.exclude1\n"
+        "git -C /testbed ls-files -z > /tmp/.tracked.z && rm -rf /testbed/.git "
+        "&& git -C /testbed init -q -b main "
+        "&& git -C /testbed add -f --pathspec-from-file=/tmp/.tracked.z --pathspec-file-nul "
+        "&& git -C /testbed -c user.name=eval -c user.email=eval@local commit -q -m base "
+        "|| { echo 'GIT REINIT FAILED' >&2; exit 97; }\n"
+        "mkdir -p /testbed/.git/info && cat /tmp/.exclude1 /tmp/.exclude0 >> /testbed/.git/info/exclude\n"
+        "EXCL=$(wc -l < /tmp/.exclude0)\n"
+        "rm -f /tmp/.tracked.z /tmp/.status0 /tmp/.exclude0 /tmp/.exclude1\n"
+        "echo \"isolation: git=reinit commits=$(git -C /testbed rev-list --all | wc -l) "
+        "dirty=$(git -C /testbed status --porcelain | wc -l) author=$(git -C /testbed log -1 --format=%ae) "
+        "dirty_before=$DIRTY0 excluded=$EXCL\" >&2\n"
+        "echo \"isolation: refs=$(git -C /testbed for-each-ref | wc -l) tags=$(git -C /testbed tag | wc -l)\" >&2\n"
+    )
+    if network_mode == "host":
+        return strip
+    py = f"$( [ -x {CONTAINER_PY} ] && echo {CONTAINER_PY} || command -v python3 )"
+    return (
+        f"BRIDGE_PY={py}\n"
+        f"\"$BRIDGE_PY\" {BRIDGE_SCRIPT_IN_CONTAINER} container {port} {BRIDGE_SOCK_IN_CONTAINER} &\n"
+        f"for i in $(seq 1 50); do \"$BRIDGE_PY\" -c \"import urllib.request,sys; "
+        f"urllib.request.urlopen('http://127.0.0.1:{port}/health', timeout=5)\" 2>/dev/null && break; sleep 0.2; done\n"
+        f"\"$BRIDGE_PY\" -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:{port}/health', timeout=10)\" "
+        f"|| {{ echo 'BRIDGE CHECK FAILED: server not reachable through the loopback bridge' >&2; exit 97; }}\n"
+        f"echo \"isolation: network=none bridge=127.0.0.1:{port}\" >&2\n"
+        # what the sandbox can read about its own mounts: bind-source paths
+        # (mountinfo field 4) — audit_leakage.py checks this line for cues
+        "echo \"isolation: mounts=$(awk '$5 != \"/\" && $5 !~ /^\\/(proc|sys|dev)/ {print $4}' /proc/self/mountinfo | tr '\\n' ' ')\" >&2\n"
+    ) + strip
+
+
+# Session stores every scaffold keeps under $HOME; copied to the bind-mounted
+# /sessions before the diff so audit_leakage.py can read the transcript after
+# the container is gone (the per-instance log only carries stdout — full tool
+# events for opencode, the final text for the others).
+SESSION_SNAPSHOT = (
+    # Transcript stores only — opencode's snapshot/ (a git object store of the
+    # work tree per session) and bin/ log/ are skipped on purpose.
+    "snap() { [ -e \"$HOME/$1\" ] || return 0; mkdir -p \"/sessions/$(dirname \"$1\")\" && cp -a \"$HOME/$1\" \"/sessions/$1\" 2>/dev/null || true; }\n"
+    "for f in \"$HOME\"/.local/share/opencode/opencode.db*; do [ -e \"$f\" ] && snap \".local/share/opencode/$(basename \"$f\")\"; done\n"
+    "snap .local/share/opencode/storage\n"
+    "snap .pi/agent/sessions\n"
+    "snap .prime/agent/sessions\n"
+    "snap .deepagents/.state\n"
+    "snap .local/share/rtk/history.db\n"
+    "chown -R --reference=/sessions /sessions 2>/dev/null || true\n"   # host uid via the bind mount's owner
+)
+
+
+def scaffold_home(scaffold_envs: list[str]) -> str:
+    """The HOME the scaffold actually runs under: the last `--env HOME=…` in
+    the scaffold's env list wins (docker takes the last occurrence), else the
+    harness default /root. opencode-dcp -> /opt/dcp-home, little-coder-rtk ->
+    /opt/rtk-home, everything else /root."""
+    home = "/root"
+    for i, tok in enumerate(scaffold_envs):
+        if tok == "--env" and i + 1 < len(scaffold_envs) and scaffold_envs[i + 1].startswith("HOME="):
+            home = scaffold_envs[i + 1][len("HOME="):]
+    return home
+
+
+def snapshot_sessions_live(container_name: str, home: str = "/root", budget_s: int = 90) -> str:
+    """Run SESSION_SNAPSHOT inside a still-running container (docker exec).
+
+    The in-script snapshot sits after the scaffold, so a wall-hit (outer
+    SIGKILL at --timeout) never reached it: the first 52 qwen38 opencode v3
+    instances shipped empty sessions/<iid>/ for exactly the 6 wall hits — the
+    sessions the benchmark-recall audit cares most about (R9700 v4: the
+    runaway think lives in the walled sessions). Called on TimeoutExpired
+    before the kill (then capture_diff_live() reads the work tree the same
+    way); the scaffold keeps running while the store is copied. Best effort:
+    a hung daemon or a vanished container just means no snapshot.
+
+    `home` must be the scaffold's HOME (scaffold_home()): the first version
+    hard-wired HOME=/root, so on the qwen38 opencode-dcp v3 lane (store under
+    /opt/dcp-home) the exec found nothing, copied nothing and still reported
+    "live" — `snap()` returns 0 on a missing path (django-11019, 2026-09-24).
+    The verdict now carries the copied file count so an empty snapshot reads
+    as one (`live files=0`).
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-e", f"HOME={home}", container_name, "bash", "-c",
+             SESSION_SNAPSHOT + "find /sessions -type f 2>/dev/null | wc -l\n"],
+            capture_output=True, text=True, errors="replace", timeout=budget_s)
+        if r.returncode != 0:
+            return f"exec rc={r.returncode}: {(r.stderr or '').strip()[-200:]}"
+        n = (r.stdout or "").strip().splitlines()[-1:] or ["?"]
+        return f"live files={n[0].strip()} home={home}"
+    except subprocess.TimeoutExpired:
+        return f"exec timed out after {budget_s}s"
+    except Exception as e:  # noqa: BLE001 — never let forensics take the lane down
+        return f"{type(e).__name__}: {e}"
+
+
+# Scaffold scratch dirs the in-script capture `rm -rf`s before its `git add
+# -A` (the union over scaffolds); the wall-hit capture excludes them by
+# pathspec instead, since the scaffold is still running when it reads the tree.
+WALL_DIFF_EXCLUDES = (".claw", ".opencode", ".sandbox-tmp", ".sandbox-home", ".cache",
+                      ".prime", ".deepagents")
+
+
+def capture_diff_live(container_name: str, budget_s: int = 60) -> tuple[str | None, str]:
+    """Capture-at-wall: read /testbed's diff from a still-running container.
+
+    Returns (diff, note); diff is None when the capture itself failed (exec
+    error / timeout / vanished container), "" when it ran and the tree is
+    clean. Until 2026-10-08 a wall hit was an empty patch *by construction*:
+    the in-script `=== DIFF ===` + `git diff --cached` sits after the scaffold
+    (and its 120 s cleanup pass), so the outer SIGKILL at --timeout never
+    reached it — complete, model-verified fixes were lost (qwen38 dcp v4
+    django-14999 / sympy-17022 finished at T−50…−90 s and died in the cleanup
+    pass; rtk v4 requests-863 / xarray-3364 lost their edits behind a stuck
+    foreground tool). R9700's sandbox diffs the tree after its in-container
+    kill and a third of their walls carry a patch (42/124 opencode v4); the
+    user ruled this a harness defect, fixed mid-cycle, so the convention is
+    now the same on both rigs: a wall hit is `rc=124` + whatever is on disk,
+    tagged `model_timeout: true` in predictions.jsonl so resolved-at-wall
+    stays separable.
+
+    Mechanics: a private index (GIT_INDEX_FILE) seeded from HEAD, so a `git`
+    the model is running at that instant neither blocks us (index.lock) nor
+    sees its index change; `add -A` over the tree minus WALL_DIFF_EXCLUDES,
+    then `diff --cached` — the same pathspec the in-script capture gets by
+    `rm -rf`. Bytes are decoded without newline translation (the stdout path
+    runs through a text pipe that folds CRLF). The scaffold is killed only
+    after this returns, so the wall budget is unchanged (+≤60 s of capture,
+    like the session snapshot before it)."""
+    ex = " ".join(f"':(exclude){d}'" for d in WALL_DIFF_EXCLUDES)
+    script = (
+        "export GIT_INDEX_FILE=/tmp/.wall-index; rm -f \"$GIT_INDEX_FILE\"\n"
+        "g() { git -C /testbed -c safe.directory=/testbed \"$@\"; }\n"
+        "g read-tree HEAD || exit 3\n"
+        f"g add -A -- . {ex} || exit 4\n"
+        f"g diff --cached -- . {ex}\n"
+    )
+    try:
+        r = subprocess.run(["docker", "exec", container_name, "bash", "-c", script],
+                           capture_output=True, timeout=budget_s)
+    except subprocess.TimeoutExpired:
+        return None, f"FAILED exec timed out after {budget_s}s"
+    except Exception as e:  # noqa: BLE001 — never let forensics take the lane down
+        return None, f"FAILED {type(e).__name__}: {e}"
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()[-200:]
+        return None, f"FAILED exec rc={r.returncode}: {err}"
+    diff = (r.stdout or b"").decode("utf-8", "replace")
+    return diff, f"ok bytes={len(diff)}"
+
+
+def _looks_like_diff(p: str) -> bool:
+    """A patch the scorer can read. The stdout extractor's `rfind` lands on a
+    `ps`-echoed copy of the marker when the session listed the inner script
+    (the marker sits in its `bash -lc` argv) and returns the JSON event tail
+    after it — not a diff (qwen38 v4 pytest-8365, sympy-13915, sympy-20212)."""
+    return p.lstrip().startswith(("diff ", "--- ", "Index: "))
+
+
+# The task prompt reaches every scaffold on STDIN from this read-only file,
+# never as a positional argument (R9700 relay 2026-09-19, reproduced here the
+# same day — see benchmarks/quality/prompt-delivery-audit-2026-09-19.md):
+#   (1) argv self-kill: the issue text was on the scaffold's own argv, so an
+#       agent running `pkill -f "manage.py runserver"` (a phrase from the
+#       issue) SIGTERMed its own scaffold mid-session (django__django-11422);
+#   (2) opencode `run` (1.14.25 here, 1.18.25 there) re-quotes a positional
+#       message containing spaces — every opencode / opencode-dcp session saw
+#       the task wrapped in `"…"` with every inner `"` escaped (176/300 issue
+#       texts contain a `"`); a piped message is used verbatim.
+# The pi family / prime / dcode read a piped stdin as the message (pi and
+# dcode trim whitespace); dcode needs --stdin. The fixed cleanup prompt goes
+# through a bash here-string for the same reason. scaffold_request_audit.py
+# proves verbatim delivery per scaffold before every cycle.
+PROMPT_FILE = "/sandbox/prompt.md"
+
+
+def build_scaffold_invocation(scaffold: str, model: str, served_name: str,
+                              timeout: int = 1800, context_window: int = 0) -> tuple[list[str], str]:
+    """Return (docker_run_extra_envs, inner_shell_command) for the given
+    scaffold. The inner command runs opencode-equivalent against $PROMPT
+    in /testbed and emits `=== DIFF ===\\n<git diff>` to stdout for the
+    parent process to extract.
+
+    All scaffolds share the same diff-capture protocol so the parent
+    `_extract_diff_from_stdout` works uniformly, and every scaffold is told
+    the same `context_window` (the served KV window) through its own config
+    surface — opencode.json limit.context, little-coder models file,
+    prime models.json contextWindow, dcode --profile-override.
+    """
+    if context_window <= 0:
+        raise ValueError("context_window must be the served window (>0); see --context-window")
+    if scaffold == "opencode":
+        # opencode reads ~/.config/opencode/opencode.json which the Dockerfile
+        # provisions. The `sglang/<served-name>` model id wires there.
+        envs = ["--env", f"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX={OUTPUT_BUDGET}"]
+        inner = (
+            f"set -e\n"
+            f"git config --global user.email eval@local\n"
+            f"git config --global user.name eval\n"
+            f"git config --global --add safe.directory /testbed\n"
+            + _opencode_budget_snippet(served_name, context_window) +
+            f"opencode run --dir /testbed --model {model} "
+            f"  --format json --dangerously-skip-permissions < {PROMPT_FILE} || true\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 opencode run --dir /testbed --model {model} "
+            f"  --format json --dangerously-skip-permissions <<<\"$CLEANUP_PROMPT\" || true\n"
+            f"echo === DIFF ===\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"git -C /testbed add -A\n"
+            f"git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "little-coder":
+        # little-coder wraps pi-ai, which reads provider baseUrls from a
+        # packaged models.json — not from OPENAI_BASE_URL. Dockerfile.rollout
+        # repoints the "llamacpp" provider's baseUrl at our SGLang endpoint,
+        # so we route through llamacpp/<served-name>. The served id is
+        # declared in a per-run models file (LITTLE_CODER_MODELS_FILE) with the
+        # served context window: the old "Using custom model id" fallback was
+        # NOT benign — pi cloned the first packaged entry and ran every preset
+        # at contextWindow 32768 (compaction loops / aborted sessions; see
+        # benchmarks/quality/rtk-lane-close-qwen38-2026-09-11.md).
+        # Runs the 1.19.0 prefix (/opt/lc-rtk, the rtk lane's install — same
+        # @earendil-works pi 0.83 backend, same bg-shell/browser tool roster)
+        # WITHOUT the rtk extension and with HOME=/root (no extensions live
+        # there; headless pi skips auto-discovery anyway), so rtk itself is
+        # the only difference from little-coder-rtk. Until 2026-10-09 the
+        # control ran the global 1.1.0 install (@mariozechner pi 0.68.1) —
+        # the A/B was a pi-version comparison (R9700 ask 154ef56); those
+        # cells are quarantined `-pi068`. The global install stays in the
+        # image until the cycle boundary (per-instance images are rebuilt
+        # from the Dockerfile as lanes roll — a mid-cycle edit would mix).
+        oc_model = f"llamacpp/{served_name}"
+        lc = "/opt/lc-rtk/node_modules/.bin/little-coder"
+        envs = [
+            "--env", f"LLAMACPP_API_KEY={api_key()}",
+        ]
+        inner = (
+            f"set -e\n"
+            f"git config --global user.email eval@local\n"
+            f"git config --global user.name eval\n"
+            f"git config --global --add safe.directory /testbed\n"
+            + _little_coder_budget_snippet("/opt/lc-rtk/node_modules/little-coder", served_name, context_window) +
+            f"cd /testbed\n"
+            f"{lc} --model {oc_model} < {PROMPT_FILE} || true\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 {lc} --model {oc_model} <<<\"$CLEANUP_PROMPT\" || true\n"
+            f"echo === DIFF ===\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"git -C /testbed add -A\n"
+            f"git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "little-coder-rtk":
+        # little-coder with the RTK bash-output compressor loaded EXPLICITLY
+        # via pi's -e flag: headless little-coder runs skip pi's extension
+        # auto-discovery (proven with a marker extension), and the session
+        # jsonl records the PRE-mutation command — engagement was verified
+        # with an rtk-shim log showing `rtk rewrite git status` -> executed
+        # `rtk git status` (2026-08-31).
+        # Uses the little-coder 1.19.0 prefix (/opt/lc-rtk): rtk's extension
+        # needs the current @earendil-works pi; the old 1.1.0 control bundle
+        # (@mariozechner pi) ignored it — verified, commands stayed
+        # unrewritten. Since 2026-10-09 the control lane runs the SAME prefix
+        # without -e. HOME override wins (scaffold envs append after
+        # --env HOME=/root; docker takes the last occurrence).
+        oc_model = f"llamacpp/{served_name}"
+        envs = [
+            "--env", "HOME=/opt/rtk-home",
+            "--env", f"LLAMACPP_API_KEY={api_key()}",
+            "--env", "RTK_TELEMETRY_DISABLED=1",
+        ]
+        inner = (
+            f"set -e\n"
+            f"git config --global user.email eval@local\n"
+            f"git config --global user.name eval\n"
+            f"git config --global --add safe.directory /testbed\n"
+            + _little_coder_budget_snippet("/opt/lc-rtk/node_modules/little-coder", served_name, context_window) +
+            f"cd /testbed\n"
+            f"/opt/lc-rtk/node_modules/.bin/little-coder -e /opt/rtk-home/.pi/agent/extensions/rtk.ts --model {oc_model} < {PROMPT_FILE} || true\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 /opt/lc-rtk/node_modules/.bin/little-coder -e /opt/rtk-home/.pi/agent/extensions/rtk.ts --model {oc_model} <<<\"$CLEANUP_PROMPT\" || true\n"
+            f"echo === DIFF ===\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"git -C /testbed add -A\n"
+            f"git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "claw-code":
+        # claw natively supports OpenAI-compat: OPENAI_BASE_URL +
+        # OPENAI_API_KEY, model id "openai/<served>". The openai/ prefix
+        # wins over the ambient credential sniffer, so DashScope's
+        # qwen-/qwen prefix routing won't intercept (claw USAGE.md
+        # "Provider matrix" + PR 3001 reasoning_content support). The
+        # rollout image must include the pre-built claw binary at
+        # /usr/local/bin/claw — Dockerfile.rollout COPYs it.
+        oc_model = f"openai/{served_name}"
+        envs = [
+            "--env", "OPENAI_BASE_URL=http://127.0.0.1:23334/v1",
+            "--env", f"OPENAI_API_KEY={api_key()}",
+        ]
+        inner = (
+            f"set -e\n"
+            f"git config --global user.email eval@local\n"
+            f"git config --global user.name eval\n"
+            f"git config --global --add safe.directory /testbed\n"
+            f"cd /testbed\n"
+            f"/usr/local/bin/claw --model {oc_model} prompt \"$(cat {PROMPT_FILE})\" || true\n"  # retired lane: claw takes a positional only (argv-exposed; historical cells)
+
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 /usr/local/bin/claw --model {oc_model} prompt \"$CLEANUP_PROMPT\" || true\n"
+            f"echo === DIFF ===\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"git -C /testbed add -A\n"
+            f"git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "opencode-dcp":
+        # Same invocation as opencode, but HOME points at the DCP-enabled
+        # config home baked by Dockerfile.rollout (plugin + dcp.jsonc). The
+        # scaffold envs are appended AFTER --env HOME=/root in the docker cmd,
+        # and docker takes the last occurrence, so this override wins.
+        envs = ["--env", "HOME=/opt/dcp-home",
+                "--env", f"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX={OUTPUT_BUDGET}"]
+        inner = (
+            f"set -e\n"
+            f"git config --global user.email eval@local\n"
+            f"git config --global user.name eval\n"
+            f"git config --global --add safe.directory /testbed\n"
+            + _opencode_budget_snippet(served_name, context_window) +
+            f"opencode run --dir /testbed --model {model} "
+            f"  --format json --dangerously-skip-permissions < {PROMPT_FILE} || true\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 opencode run --dir /testbed --model {model} "
+            f"  --format json --dangerously-skip-permissions <<<\"$CLEANUP_PROMPT\" || true\n"
+            f"echo === DIFF ===\n"
+            f"rm -rf /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"git -C /testbed add -A\n"
+            f"git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "prime":
+        # prime-agent reads custom providers from ~/.prime/agent/models.json
+        # (no config-dir override as of 0.8.1) — written HERE with the actual
+        # served name so new presets need no static enumeration. compat flags
+        # follow the SGLang guidance (ported from R9700's host-side runner,
+        # verified by them on prime-agent 0.8.1). DO_NOT_TRACK: prime sends
+        # pseudonymous usage metrics by default; eval rollouts don't phone home.
+        provider_json = json.dumps({
+            "providers": {"sglang": {
+                "name": "SGLang local",
+                "baseUrl": "http://127.0.0.1:23334/v1",
+                "api": "openai-completions",
+                "apiKey": api_key(),
+                "compat": {"supportsDeveloperRole": False,
+                           "supportsReasoningEffort": False},
+                # explicit budget: prime-agent's custom-provider default is
+                # contextWindow 128000 / maxTokens 16384 (model-registry.js)
+                "models": [{"id": served_name,
+                            "contextWindow": int(context_window),
+                            "maxTokens": OUTPUT_BUDGET}],
+            }}}, indent=2)
+        envs = ["--env", "DO_NOT_TRACK=1"]
+        inner = (
+            "set -e\n"
+            "git config --global user.email eval@local\n"
+            "git config --global user.name eval\n"
+            "git config --global --add safe.directory /testbed\n"
+            "mkdir -p /root/.prime/agent\n"
+            "cat > /root/.prime/agent/models.json <<'PRIMEJSON'\n"
+            f"{provider_json}\n"
+            "PRIMEJSON\n"
+            + _pi_settings_snippet("/root/.prime/agent") +
+            "cd /testbed\n"
+            f"prime-agent --model sglang/{served_name} -p < {PROMPT_FILE} || true\n"
+            "rm -rf /testbed/.prime /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 prime-agent --model sglang/{served_name} -p <<<\"$CLEANUP_PROMPT\" || true\n"
+            "echo === DIFF ===\n"
+            "rm -rf /testbed/.prime /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            "git -C /testbed add -A\n"
+            "git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    if scaffold == "dcode":
+        # deepagents-code headless: -n runs one task and exits (-q clean
+        # output); tools auto-run headless. Model routing is plain openai-SDK
+        # env (OPENAI_BASE_URL + `openai:<served>`; SGLang ignores the id).
+        # The inner --timeout is derived from the outer per-instance timeout
+        # (outer minus 100 s) so dcode always exits on its own before the
+        # outer SIGKILL — a fixed inner value bit the 900 s smoke runs
+        # (rc=124 mid-session -> empty diff). Ported from R9700, 0.1.65.
+        envs = [
+            "--env", "OPENAI_BASE_URL=http://127.0.0.1:23334/v1",
+            "--env", f"OPENAI_API_KEY={api_key()}",
+        ]
+        inner = (
+            "set -e\n"
+            "git config --global user.email eval@local\n"
+            "git config --global user.name eval\n"
+            "git config --global --add safe.directory /testbed\n"
+            "cd /testbed\n"
+            # --profile-override: langchain has no profile for a custom
+            # openai:<id>, so deepagents falls back to a fixed 170K-token
+            # summarization trigger; with max_input_tokens set it uses
+            # fraction 0.85 of the served window.
+            f"dcode -M openai:{served_name} --profile-override '{{\"max_input_tokens\": {int(context_window)}}}' --stdin -q --max-turns 60 -S all --allow-fs-tools all --timeout {max(60, timeout - 100)} < {PROMPT_FILE} || true\n"
+            "rm -rf /testbed/.deepagents /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            f"timeout 120 dcode -M openai:{served_name} --profile-override '{{\"max_input_tokens\": {int(context_window)}}}' --stdin -q --max-turns 8 -S all --allow-fs-tools all --timeout 100 <<<\"$CLEANUP_PROMPT\" || true\n"
+            "echo === DIFF ===\n"
+            "rm -rf /testbed/.deepagents /testbed/.claw /testbed/.opencode /testbed/.sandbox-tmp /testbed/.sandbox-home /testbed/.cache\n"
+            "git -C /testbed add -A\n"
+            "git -C /testbed diff --cached\n"
+        )
+        return envs, inner
+
+    raise ValueError(f"unknown scaffold: {scaffold}")
+
+
+# --- helpers ---------------------------------------------------------------
+
+def sh(*args, check=True, capture=False, cwd=None, env=None, timeout=None):
+    """subprocess.run wrapper. capture=True returns (rc, stdout, stderr)."""
+    kwargs = {
+        "cwd": cwd,
+        "env": env,
+        "timeout": timeout,
+    }
+    if capture:
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
+    proc = subprocess.run(list(args), check=False, **kwargs)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args,
+                                            output=proc.stdout if capture else None,
+                                            stderr=proc.stderr if capture else None)
+    if capture:
+        return proc.returncode, proc.stdout, proc.stderr
+    return proc.returncode
+
+
+def _swebench_image_tag(instance_id: str) -> str:
+    """Upstream eval image tag for a SWE-bench instance.
+
+    SWE-bench normalizes `<org>__<repo>-<n>` to `<org>_1776_<repo>-<n>` for
+    Docker tag compatibility (image tags can't contain `__` consistently).
+    """
+    normalized = instance_id.replace("__", "_1776_")
+    return f"swebench/sweb.eval.x86_64.{normalized}:latest"
+
+
+def rollout_image_tag(instance_id: str) -> str:
+    """Local rollout image tag (eval image + Node + opencode + ripgrep)."""
+    return f"swebench-rollout/{instance_id}:latest"
+
+
+def ensure_rollout_image(instance_id: str, *, no_pull: bool = False,
+                         rebuild: bool = False) -> str:
+    """Build the per-instance rollout image if not already present.
+
+    Idempotent: docker build is a no-op when the tag exists with all layers
+    cached, so re-runs after the first instance build are fast. With
+    rebuild=True, forces a fresh build even if the tag already resolves —
+    use after Dockerfile.rollout changes (e.g. adding a new scaffold).
+    """
+    rollout_tag = rollout_image_tag(instance_id)
+    base_tag = _swebench_image_tag(instance_id)
+
+    if not rebuild:
+        rc, out, _ = sh("docker", "image", "inspect", rollout_tag,
+                        check=False, capture=True)
+        if rc == 0:
+            return rollout_tag
+
+    if not no_pull:
+        rc_pull = sh("docker", "pull", base_tag, check=False)
+        if rc_pull != 0:
+            raise RuntimeError(f"docker pull {base_tag} failed (rc={rc_pull})")
+
+    sh("docker", "build",
+       "-t", rollout_tag,
+       "--build-arg", f"BASE={base_tag}",
+       "-f", str(DOCKERFILE),
+       str(DOCKER_CTX),
+       check=True)
+    return rollout_tag
+
+
+PROMPT_TEMPLATE = """\
+You are working on a GitHub issue in this repository.
+
+The repo is already installed in editable mode in the active conda environment
+on your PATH (testbed). You can run `pytest` and `python -c "..."` to verify
+imports, exercise edge cases, and re-run tests after each edit. Use this:
+write a fix, run the relevant tests, observe failures, refine until green.
+
+Read the problem carefully, locate the relevant code, and write the minimal
+patch that fixes the bug. Do not modify tests. Do not add new files unless
+strictly required. When you're confident the fix is correct AND the tests
+exercise it correctly, stop — your final state will be captured as a `git diff`.
+
+# Problem
+
+{problem_statement}
+
+# Hints (optional, may be empty)
+
+{hints}
+"""
+
+
+# Self-clean pass: invoked AFTER the original prompt finishes. Same scaffold,
+# same model, fresh session. The model inspects git state and rm's its own
+# reproducer/debug helpers so they don't make it into the captured diff. Why
+# this matters: SWE-bench's grader marks an instance "error" (not unresolved)
+# when pytest collects a model-written helper at /testbed root that errors
+# at import time, because then the harness can't find FAIL_TO_PASS test
+# results in the malformed log. See evals/swebench/filter_predictions.py
+# for the score-time regex fallback that catches what self-clean misses.
+CLEANUP_PROMPT = """\
+Cleanup step. You just finished fixing a bug in this Python repository. The original task said "Do not add new files unless strictly required" — but during exploration you may have created reproducer / debug / analysis scripts. Clean those up now so only your real fix remains.
+
+Steps:
+1. Run `git status` to see what changed.
+2. For each NEW file at the repository root (or other non-standard location) that looks like a model-generated helper — names matching reproduce_*, debug_*, analyze_*, test_fix*, simple_test_*, comprehensive_*, check_*, *_bug.py, etc. — delete it with `rm`.
+3. Do NOT touch modifications to pre-existing tracked files: those are your real fix.
+4. Do NOT delete files inside the official test directory (tests/, test_*/, *_test/).
+
+After cleanup, stop. Don't run pytest, don't edit any code.
+"""
+
+
+def run_in_container(image_tag: str, instance_id: str, prompt: str, model: str,  # unused since the scaffold table; kept for ad-hoc probes — NO isolation
+                     timeout: int, log_path: Path, *, keep: bool = False) -> tuple[int, str, str]:
+    """Run opencode inside the rollout container; return (rc, stdout, stderr).
+
+    The container runs in a fresh process group so we can SIGKILL the whole
+    docker subtree on timeout. Default removes the container after exit;
+    --keep-containers preserves them for debugging.
+    """
+    container_name = f"swebench-rollout-{instance_id}-{int(time.time())}"
+    rm_flag = [] if keep else ["--rm"]
+
+    # `git config --global` ensures the diff-on-exit path doesn't trip on
+    # missing user.email/name inside the container.
+    inner = f"""set -e
+git config --global user.email eval@local
+git config --global user.name eval
+git config --global --add safe.directory /testbed
+opencode run --dir /testbed --model {model} --format json --dangerously-skip-permissions "$PROMPT"
+"""
+
+    cmd = [
+        "docker", "run",
+        *rm_flag,
+        "--name", container_name,
+        "--network=host",
+        "--env", f"PROMPT={prompt}",
+        "--env", "HOME=/root",
+        "--workdir", "/testbed",
+        image_tag,
+        "bash", "-lc", ACTIVATE_TESTBED + inner,
+    ]
+
+    t0 = time.time()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+        elapsed = time.time() - t0
+        log_path.write_text(
+            f"# command (PROMPT in env)\n{' '.join(cmd[:-3])} bash -lc <inner>\n"
+            f"# elapsed {elapsed:.1f}s\n# returncode {rc}\n"
+            f"# stdout\n{stdout}\n# stderr\n{stderr}\n"
+        )
+        return rc, stdout, stderr
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        # Belt-and-suspenders: ask docker to kill the container too. The
+        # docker CLI process getting SIGKILLed doesn't necessarily reap the
+        # daemon-managed container.
+        sh("docker", "kill", container_name, check=False, capture=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        log_path.write_text(
+            f"# TIMEOUT after {timeout}s (process group + docker kill)\n"
+            f"# stdout\n{stdout}\n# stderr\n{stderr}\n"
+        )
+        return 124, stdout or "", stderr or ""
+
+
+def capture_diff(image_tag: str, instance_id: str) -> str:
+    """Run a fresh container against the same image to capture a `git diff` is
+    not viable — the rollout container is gone (--rm) and held the worktree.
+    Instead we capture inside the same `inner` shell script in run_in_container
+    by appending `git add -A && git diff --cached`. This function exists only
+    to keep the v1 schema symmetry; the actual diff capture happens in
+    run_in_container's stdout (parsed below)."""
+    raise NotImplementedError("diff capture is inlined into run_in_container; see _extract_diff_from_stdout")
+
+
+def _extract_diff_from_stdout(stdout: str) -> str:
+    """The inner shell appends `=== DIFF ===` then `git diff --cached` output.
+    Strip everything before that marker."""
+    marker = "=== DIFF ==="
+    idx = stdout.rfind(marker)
+    if idx == -1:
+        return ""
+    return stdout[idx + len(marker):].lstrip("\n")
+
+
+# --- preflight + dataset ---------------------------------------------------
+
+def preflight_canary(server_url: str, served_name: str) -> tuple[bool, str]:
+    """Mimic opencode's wire format (assistant turn with prior tool_calls,
+    arguments as JSON string per OpenAI spec) to catch chat-template bugs
+    before burning hours on rollouts. Same shape as run_rollouts.py."""
+    payload = {
+        "model": served_name,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "1", "type": "function",
+                             "function": {"name": "glob",
+                                          "arguments": '{"pattern": "**/*.py"}'}}]},
+            {"role": "tool", "tool_call_id": "1", "content": "a.py\nb.py"},
+            {"role": "user", "content": "continue"},
+        ],
+        "max_tokens": 30,
+        "temperature": 0.0,
+    }
+    req = urllib.request.Request(
+        f"{server_url}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers=_auth_headers(),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = json.loads(r.read())
+            if "choices" in body and body["choices"]:
+                content = body["choices"][0]["message"].get("content") or ""
+                return True, f"OK ({len(content)}B content)"
+            return False, f"unexpected response: {body!r}"
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read())["message"]
+        except Exception:
+            err = str(e)
+        return False, f"{e.code}: {err}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def served_context_window(server_url: str, served: str) -> int | None:
+    """max_model_len the server advertises for `served` on /v1/models (SGLang
+    reports the launch --context-length there). None if unavailable."""
+    try:
+        req = urllib.request.Request(f"{server_url}/v1/models", headers=_auth_headers())
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = json.loads(r.read())
+    except Exception:
+        return None
+    cards = body.get("data") or []
+    for c in cards:
+        if c.get("id") == served and c.get("max_model_len"):
+            return int(c["max_model_len"])
+    if len(cards) == 1 and cards[0].get("max_model_len"):
+        return int(cards[0]["max_model_len"])
+    return None
+
+
+# Serving-config provenance for meta.json (v4 campaign, 2026-09-27): the fields
+# that decide decode speed / wall rate but are invisible in the argv the cell
+# was rolled with. SGLang's /get_server_info returns the flattened server_args
+# plus the runtime pool; take only what matters and never the key material.
+SERVER_INFO_KEYS = ("speculative_algorithm", "speculative_num_draft_tokens",
+                    "speculative_draft_model_path", "kv_cache_dtype", "dtype",
+                    "context_length", "max_total_num_tokens", "mem_fraction_static",
+                    "chunked_prefill_size", "version")
+
+
+def served_config(server_url: str) -> dict | None:
+    """Subset of /get_server_info (SERVER_INFO_KEYS); None if unavailable."""
+    try:
+        req = urllib.request.Request(f"{server_url}/get_server_info", headers=_auth_headers())
+        with urllib.request.urlopen(req, timeout=30) as r:
+            info = json.loads(r.read())
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    out = {k: info.get(k) for k in SERVER_INFO_KEYS if info.get(k) is not None}
+    if isinstance(out.get("speculative_draft_model_path"), str):
+        out["speculative_draft_model_path"] = os.path.basename(out["speculative_draft_model_path"].rstrip("/"))
+    return out or None
+
+
+# pi (little-coder) prints this when the model id is not in the provider's
+# models.json and it clones the first entry (32K). With the per-run models
+# file below it must never appear; if it does, the context budget was NOT
+# applied and the instance ran at 32K.
+PI_FALLBACK_MARKER = "not found for provider"
+
+
+def load_dataset(dataset_id: str, split: str):
+    from datasets import load_dataset as _ld
+    return _ld(dataset_id, split=split)
+
+
+# --- main ------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    served = args.served_name or args.model.split("/", 1)[-1]
+    pin = scaffold_pin(args.scaffold)
+    if args.skip_existing and (Path(args.out) / "predictions.jsonl").exists():
+        ok, msg = check_cell_pin(Path(args.out) / "predictions.jsonl", args.scaffold)
+        print(f"  resume: {msg}", flush=True)
+        if not ok:
+            return 2
+    print(f"Preflight: canary chat completion against {args.server_url} (model={served})...", flush=True)
+    ok, info = preflight_canary(args.server_url, served)
+    if not ok:
+        print(f"  PREFLIGHT FAILED: {info}", flush=True)
+        print(f"  refusing to start rollout — fix the server / chat template first", flush=True)
+        return 2
+    print(f"  preflight {info}", flush=True)
+
+    if args.context_window > 0:
+        ctx, ctx_src = args.context_window, "--context-window"
+    else:
+        ctx, ctx_src = served_context_window(args.server_url, served), "server /v1/models max_model_len"
+    if not ctx:
+        print("  CONTEXT BUDGET UNKNOWN: /v1/models did not report max_model_len — pass --context-window", flush=True)
+        return 2
+    print(f"Context budget: {ctx} tokens for every scaffold (source: {ctx_src})", flush=True)
+
+    out = Path(args.out)
+    (out / "predictions").mkdir(parents=True, exist_ok=True)
+    (out / "logs").mkdir(parents=True, exist_ok=True)
+    (out / "sessions").mkdir(parents=True, exist_ok=True)
+
+    # Network isolation (see the section comment above network_docker_args).
+    bridge_sock = None
+    if args.network_mode == "none":
+        bridge_sock = start_host_bridge(args.server_url)
+        print(f"Isolation: containers run --network none; in-container 127.0.0.1:{CONTAINER_SERVER_PORT} "
+              f"-> {bridge_sock} -> {args.server_url}", flush=True)
+    else:
+        print("Isolation: OFF (--network-mode host) — scaffolds can reach the internet; "
+              "cells rolled this way are exposure-confounded", flush=True)
+
+    # meta.json declares scaffold + model + run dates so future tooling can
+    # group predictions.jsonl files by scaffold without inferring from the
+    # parent dirname. Idempotent: appends a new run record on resume.
+    meta_path = out / "meta.json"
+    meta = {"runs": []}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            pass
+    meta.setdefault("runs", []).append({
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "scaffold": args.scaffold,
+        "model": args.model,
+        "served_name": args.served_name or args.model.split("/", 1)[-1],
+        "dataset": args.dataset,
+        "split": args.split,
+        "timeout_sec": args.timeout,
+        "scaffold_pin": scaffold_pin(args.scaffold),   # see check_cell_pin
+        "context_window": ctx,
+        "context_window_source": ctx_src,
+        # harness policy this run rolled under (see OUTPUT_BUDGET / thinking
+        # policy above; scaffold_request_audit.py proves it on the wire)
+        "output_budget": OUTPUT_BUDGET,
+        "thinking": "max (template default; no reasoning_effort sent)",
+        # what served the cell (serve_backend.sh exports these; bare metal =
+        # the live tree, docker = the pinned OCI image by id)
+        "serve_mode": os.environ.get("SWEBENCH_SERVE_MODE", "bare"),
+        "serve_image": os.environ.get("SWEBENCH_SERVE_IMAGE"),
+        "serve_image_id": os.environ.get("SWEBENCH_SERVE_IMAGE_ID"),
+        "api_auth": api_auth_enabled(),
+        # the serving config the cell actually ran under (spec-decode algorithm,
+        # KV dtype, pool) — v4 cells serve qwen38 with DSpark, v3 = no-spec
+        "served_config": served_config(args.server_url),
+        # answer-leakage controls (2026-09-19): no container network beyond the
+        # loopback bridge to the server, git refs stripped to HEAD, per-instance
+        # session-store snapshot under sessions/<iid> for audit_leakage.py
+        "network_mode": args.network_mode,
+        "prompt_delivery": "stdin-file",   # argv-era cells (re-quoted opencode task, self-kill exposure) have no key
+        "git_refs_stripped": True,
+        "git_history": "reinit-1-commit",  # official image HEAD (`SWE-bench <setup@swebench.com>`) replaced by one eval@local commit
+        "session_snapshot": True,
+        "mount_staging": "neutral",   # bind sources under /var/tmp/rs-*: no benchmark/instance/model/scaffold in mountinfo
+    })
+    meta["scaffold"] = args.scaffold
+    meta["model"] = args.model
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    print(f"Scaffold: {args.scaffold}   Model: {args.model}   Out: {out}", flush=True)
+
+    print(f"Loading dataset {args.dataset}/{args.split}...", flush=True)
+    ds = load_dataset(args.dataset, args.split)
+    print(f"  {len(ds)} instances total", flush=True)
+
+    if args.instance_ids:
+        ds = [r for r in ds if r["instance_id"] in args.instance_ids]
+        print(f"  filtered to {len(ds)} via --instance-ids", flush=True)
+    elif args.instances:
+        ds = list(ds)[: args.instances]
+        print(f"  truncated to first {len(ds)} via --instances", flush=True)
+
+    predictions_path = out / "predictions.jsonl"
+    existing = set()
+    if args.skip_existing and predictions_path.exists():
+        for line in predictions_path.read_text().splitlines():
+            try:
+                existing.add(json.loads(line)["instance_id"])
+            except Exception:
+                pass
+        print(f"  resume: {len(existing)} predictions already on disk", flush=True)
+
+    empty_streak = 0
+    with predictions_path.open("a") as fp:
+        for i, row in enumerate(ds):
+            iid = row["instance_id"]
+            if iid in existing:
+                print(f"[{i+1}/{len(ds)}] {iid}  SKIP (exists)", flush=True)
+                continue
+
+            print(f"[{i+1}/{len(ds)}] {iid}  repo={row['repo']}  base={row['base_commit'][:8]}", flush=True)
+            t0 = time.time()
+            try:
+                image_tag = ensure_rollout_image(
+                    iid, no_pull=args.no_pull, rebuild=args.rebuild_image,
+                )
+                prompt = PROMPT_TEMPLATE.format(
+                    problem_statement=row["problem_statement"],
+                    hints=row.get("hints_text", "") or "(none)",
+                )
+                # exact bytes delivered (stdin via PROMPT_FILE) — a receipt per instance
+                prompt_path = out / "logs" / f"{iid}.prompt.md"
+                prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                prompt_path.write_text(prompt)
+                scaffold_envs, inner_with_diff = build_scaffold_invocation(
+                    args.scaffold, args.model, served, timeout=args.timeout,
+                    context_window=ctx,
+                )
+                container_name = f"swebench-rollout-{iid}-{int(time.time())}"
+                sessions_dir = out / "sessions" / iid
+                stage = stage_instance_mounts(prompt)
+                inner = (
+                    ACTIVATE_TESTBED
+                    + isolation_prelude(args.network_mode)
+                    + inner_with_diff.replace("echo === DIFF ===",
+                                              SESSION_SNAPSHOT + "echo === DIFF ===", 1)
+                )
+                cmd = [
+                    "docker", "run",
+                    *([] if args.keep_containers else ["--rm"]),
+                    "--name", container_name,
+                    *network_docker_args(args.network_mode, bridge_sock, stage),
+                    "-v", f"{stage / 'prompt.md'}:{PROMPT_FILE}:ro",
+                    "--env", f"CLEANUP_PROMPT={CLEANUP_PROMPT}",
+                    "--env", "HOME=/root",
+                    *scaffold_envs,
+                    "--workdir", "/testbed",
+                    image_tag,
+                    "bash", "-lc", inner,
+                ]
+                assert_no_harness_cues(cmd, iid)
+                log_path = out / "logs" / f"{iid}.log"
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        errors="replace",
+                        start_new_session=True,
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=args.timeout)
+                        rc = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        snap = snapshot_sessions_live(container_name, scaffold_home(scaffold_envs))
+                        wall_diff, wall_note = capture_diff_live(container_name)
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                        sh("docker", "kill", container_name, check=False, capture=True)
+                        try:
+                            stdout, stderr = proc.communicate(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            stdout, stderr = "", ""
+                        stderr = (stderr or "") + (f"\n# wall-hit session snapshot: {snap}\n"
+                                                   f"# wall-hit diff capture: {wall_note}\n")
+                        rc = 124
+                finally:
+                    collect_stage(stage, sessions_dir)
+
+                elapsed = round(time.time() - t0, 1)
+                log_path.write_text(
+                    f"# command (prompt on stdin: logs/{iid}.prompt.md -> {PROMPT_FILE} via {stage.name}/, never argv; "
+                    f"mounts staged under {STAGE_ROOT})\n"
+                    f"# elapsed {elapsed}s   rc={rc}\n"
+                    f"# stdout\n{stdout}\n# stderr\n{stderr}\n"
+                )
+
+                if args.scaffold.startswith("little-coder") and PI_FALLBACK_MARKER in (stderr + stdout):
+                    print(f"  CONTEXT-BUDGET TRIPWIRE: pi reported '{PI_FALLBACK_MARKER}' — the per-run "
+                          f"models file was not honoured; this instance ran at the 32K fallback", flush=True)
+
+                if rc == 124:
+                    # capture-at-wall (2026-10-08): the patch is what was on
+                    # disk when the wall hit, never the stdout tail (empty or
+                    # a `ps`-echoed marker). If the exec itself failed, the
+                    # stdout path is accepted only when it is a real diff
+                    # (container finished in the race); otherwise the row is
+                    # `wall-exec-failed` and audit_predictions re-rolls it.
+                    if wall_diff is not None:
+                        diff, patch_source = wall_diff, "wall-exec"
+                    else:
+                        cand = _extract_diff_from_stdout(stdout)
+                        diff = cand if _looks_like_diff(cand) else ""
+                        patch_source = "stdout-fallback" if diff else "wall-exec-failed"
+                else:
+                    diff, patch_source = _extract_diff_from_stdout(stdout), "stdout"
+                (out / "predictions" / f"{iid}.diff").write_text(diff)
+                entry = {
+                    "instance_id": iid,
+                    "model_name_or_path": args.model,
+                    "model_patch": diff,
+                    "rollout_returncode": rc,
+                    "rollout_seconds": elapsed,
+                    "rollout_scaffold": args.scaffold,
+                    "scaffold_pin": pin,
+                    "model_timeout": rc == 124,
+                    "patch_source": patch_source,
+                }
+                fp.write(json.dumps(entry) + "\n")
+                fp.flush()
+
+                non_empty = "yes" if diff.strip() else "EMPTY"
+                tag = "" if patch_source == "stdout" else f" [{patch_source}]"
+                print(f"  done rc={rc} elapsed={elapsed}s diff={non_empty} ({len(diff)}B){tag}", flush=True)
+
+                if diff.strip():
+                    empty_streak = 0
+                else:
+                    empty_streak += 1
+                    if empty_streak >= args.max_empty_streak:
+                        print(f"\nABORT: {empty_streak} consecutive empty diffs — re-run preflight before resuming.", flush=True)
+                        return 3
+            except Exception as e:
+                import traceback
+                print(f"  SKIP (instance crashed): {type(e).__name__}: {e}", flush=True)
+                traceback.print_exc()
+                fp.write(json.dumps({"instance_id": iid, "model_name_or_path": args.model,
+                                     "model_patch": "", "rollout_returncode": -1,
+                                     "rollout_error": f"{type(e).__name__}: {e}",
+                                     "rollout_seconds": round(time.time() - t0, 1)}) + "\n")
+                fp.flush()
+                continue
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

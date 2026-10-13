@@ -1,0 +1,185 @@
+{
+  "tag": "qwen3-ream",
+  "timestamp": "2026-06-08 01:23",
+  "max_context": 262144,
+  "thinking": {
+    "results": [
+      {
+        "name": "simple_mc",
+        "tokens": 2,
+        "finish": "stop",
+        "has_think_tags": false,
+        "clean_answer": true,
+        "truncated": false
+      },
+      {
+        "name": "reasoning",
+        "tokens": 4,
+        "finish": "stop",
+        "has_think_tags": false,
+        "clean_answer": true,
+        "truncated": false
+      },
+      {
+        "name": "knowledge",
+        "tokens": 2,
+        "finish": "stop",
+        "has_think_tags": false,
+        "clean_answer": true,
+        "truncated": false
+      },
+      {
+        "name": "code",
+        "tokens": 2,
+        "finish": "stop",
+        "has_think_tags": false,
+        "clean_answer": true,
+        "truncated": false
+      },
+      {
+        "name": "hard_mc",
+        "tokens": 2,
+        "finish": "stop",
+        "has_think_tags": false,
+        "clean_answer": true,
+        "truncated": false
+      }
+    ],
+    "think_tags_rate": 0.0,
+    "clean_answer_rate": 1.0,
+    "truncation_rate": 0.0,
+    "avg_tokens": 2.4
+  },
+  "mmlu": {
+    "correct": 46,
+    "total": 57,
+    "accuracy": 0.8070175438596491
+  },
+  "humaneval": {
+    "passed": 11,
+    "total": 40,
+    "pass_rate": 0.275
+  },
+  "labbench": {
+    "LitQA2": {
+      "correct": 4,
+      "total": 20,
+      "accuracy": 0.2
+    },
+    "DbQA": {
+      "correct": 5,
+      "total": 20,
+      "accuracy": 0.25
+    },
+    "SuppQA": {
+      "correct": 10,
+      "total": 20,
+      "accuracy": 0.5
+    },
+    "TableQA": {
+      "correct": 7,
+      "total": 20,
+      "accuracy": 0.35
+    },
+    "ProtocolQA": {
+      "correct": 8,
+      "total": 20,
+      "accuracy": 0.4
+    },
+    "SeqQA": {
+      "correct": 9,
+      "total": 20,
+      "accuracy": 0.45
+    },
+    "CloningScenarios": {
+      "correct": 6,
+      "total": 20,
+      "accuracy": 0.3
+    },
+    "_overall": {
+      "correct": 49,
+      "total": 140,
+      "accuracy": 0.35
+    }
+  },
+  "needle": {
+    "results": [
+      {
+        "context": 1024,
+        "depth": 0.1,
+        "found": true
+      },
+      {
+        "context": 1024,
+        "depth": 0.5,
+        "found": true
+      },
+      {
+        "context": 1024,
+        "depth": 0.9,
+        "found": true
+      },
+      {
+        "context": 16384,
+        "depth": 0.1,
+        "found": true
+      },
+      {
+        "context": 16384,
+        "depth": 0.5,
+        "found": true
+      },
+      {
+        "context": 16384,
+        "depth": 0.9,
+        "found": true
+      },
+      {
+        "context": 65536,
+        "depth": 0.1,
+        "found": true
+      },
+      {
+        "context": 65536,
+        "depth": 0.5,
+        "found": true
+      },
+      {
+        "context": 65536,
+        "depth": 0.9,
+        "found": true
+      },
+      {
+        "context": 131072,
+        "depth": 0.1,
+        "found": true
+      },
+      {
+        "context": 131072,
+        "depth": 0.5,
+        "found": true
+      },
+      {
+        "context": 131072,
+        "depth": 0.9,
+        "found": true
+      },
+      {
+        "context": 250000,
+        "depth": 0.1,
+        "found": true
+      },
+      {
+        "context": 250000,
+        "depth": 0.5,
+        "found": true
+      },
+      {
+        "context": 250000,
+        "depth": 0.9,
+        "found": true
+      }
+    ],
+    "score": 1.0
+  }
+}

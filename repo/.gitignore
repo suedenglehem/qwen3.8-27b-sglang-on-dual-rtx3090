@@ -1,0 +1,37 @@
+# Cloned and built by setup.sh / scripts/build_claw.sh
+components/sglang/
+components/sglang.v0.5.*-prepped/
+components/sglang.v0.5.*-backup-*/
+components/claw-code/
+components/llmcompressor/
+
+# Built scaffold binary — regenerate via scripts/build_claw.sh
+evals/swebench/docker/claw
+
+# Bake-off rollouts + per-phase scoring artifacts (large, reproducible)
+evals/swebench/runs/
+
+# SWE-bench harness per-instance test outputs + stray score reports the
+# harness drops in CWD when --report_dir isn't honored
+logs/
+sglang__*.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.jsonl
+build/
+
+# GPTQ calibration temp files
+gptqmodel_offload/
+gptq_log_*.log
+
+# Auto-generated daily bake-off snapshot reports (aggregate_bakeoff.py emits
+# evals/swebench/bake-off-YYYY-MM-DD.md). They're regenerable from the run dirs
+# under evals/swebench/runs/; keeping them out of source control prevents a
+# monthly accumulation of historical dated files.
+evals/swebench/bake-off-2026-*.md
+
+# Vendored prime-agent installer footprint — regenerate/fetch via evals/swebench/vendor_prime_agent.sh
+evals/swebench/docker/prime-agent-*-vendor.tgz

@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from llmcompressor.modeling.moe_context import MoECalibrationModule
+from llmcompressor.utils.dev import skip_weights_initialize
+
+if TYPE_CHECKING:
+    from transformers import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+        Qwen3VLMoeTextExperts,
+    )
+
+
+class Qwen3VLMoeTextExpertsList(torch.nn.ModuleList):
+    """Unpack 3D Qwen3VLMoeTextExperts into per-expert Qwen3VLMoeTextMLP.
+
+    Mirror of `Qwen3MoeExpertsList` for the Qwen3-VL-MoE text-side experts.
+    Storage layout (verified via debug print):
+      gate_up_proj: (E, 2*I, H)   — rows 0:I are gate, rows I:2I are up
+      down_proj:    (E, H, I)
+    `Qwen3VLMoeTextMLP` accepts `intermediate_size` kwarg overriding the
+    dense `config.intermediate_size` (much larger than `moe_intermediate_size`).
+    """
+
+    def __init__(self, config: "Qwen3VLMoeTextConfig", original: "Qwen3VLMoeTextExperts"):
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeTextMLP,
+        )
+
+        self.num_experts = config.num_experts
+        moe_intermediate = config.moe_intermediate_size
+
+        with skip_weights_initialize():
+            super().__init__(
+                [
+                    Qwen3VLMoeTextMLP(config, intermediate_size=moe_intermediate)
+                    for _ in range(self.num_experts)
+                ]
+            )
+
+        gate_up = original.gate_up_proj.data  # (E, 2*I, H)
+        down = original.down_proj.data  # (E, H, I)
+
+        for i in range(self.num_experts):
+            self[i].gate_proj.weight.data = (
+                gate_up[i, :moe_intermediate, :].clone().contiguous()
+            )
+            self[i].up_proj.weight.data = (
+                gate_up[i, moe_intermediate:, :].clone().contiguous()
+            )
+            self[i].down_proj.weight.data = down[i].clone().contiguous()
+
+        # Release fused 3D tensors so we don't double the MoE footprint and
+        # so save_pretrained doesn't trip on empty parameters.
+        del gate_up, down
+        if "gate_up_proj" in original._parameters:
+            del original._parameters["gate_up_proj"]
+        if "down_proj" in original._parameters:
+            del original._parameters["down_proj"]
+
+
+@MoECalibrationModule.register("Qwen3VLMoeTextExperts")
+class SequentialQwen3VLMoeTextExperts(MoECalibrationModule):
+    """Unfuse Qwen3VLMoeTextExperts to per-expert nn.Linear modules at calib.
+
+    Mirror of `SequentialQwen3MoeExperts`: replaces only the inner experts
+    module so the parent `Qwen3VLMoeTextSparseMoeBlock`'s own forward (which
+    handles the transformers ≥5.5 router that returns
+    `(router_logits, routing_weights, selected_experts)`) keeps working
+    untouched.  The block calls `self.experts(hidden_states, top_k_index,
+    top_k_weights)`; this class implements that 3-arg forward.
+
+    `is_permanent = True` so the unfused per-expert layout is what gets
+    saved — SGLang's Qwen3VLMoe loader's `expert_params_mapping`
+    (`ckpt_gate_proj_name="gate_proj"`, etc.) already expects that.
+    """
+
+    is_permanent = True
+
+    def __init__(
+        self,
+        original: "Qwen3VLMoeTextExperts",
+        config: "Qwen3VLMoeConfig",
+        calibrate_all_experts: bool = True,
+    ):
+        super().__init__()
+        text_config: "Qwen3VLMoeTextConfig" = config.get_text_config()
+
+        self.num_experts = text_config.num_experts
+        self.hidden_dim = text_config.hidden_size
+        self.intermediate_dim = text_config.moe_intermediate_size
+        self.calibrate_all_experts = calibrate_all_experts
+
+        expert_list = Qwen3VLMoeTextExpertsList(text_config, original)
+        for i, expert in enumerate(expert_list):
+            self.add_module(str(i), expert)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        expert_mask = torch.nn.functional.one_hot(
+            top_k_index, num_classes=self.num_experts
+        )
+        expert_mask = expert_mask.permute(2, 1, 0)
+
+        for expert_idx in range(self.num_experts):
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            expert_layer = getattr(self, str(expert_idx))
+
+            if self.calibrate_all_experts:
+                expert_out = expert_layer(hidden_states)[token_idx]
+            else:
+                expert_out = expert_layer(hidden_states[token_idx])
+
+            if len(token_idx) > 0:
+                current_hidden_states = (
+                    expert_out * top_k_weights[token_idx, top_k_pos, None]
+                )
+                final_hidden_states.index_add_(
+                    0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+                )
+
+        return final_hidden_states

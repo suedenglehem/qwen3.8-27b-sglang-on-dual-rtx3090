@@ -1,0 +1,120 @@
+#!/bin/bash
+# run_all_cycles.sh — chain run_model_cycle.sh across the bake-off queue.
+#
+# Single user invocation kicks off all pending model cycles back-to-back.
+# Per-cycle log: /tmp/run-model-cycle-logs/<preset>/wrapper.log
+# Queue log:    /tmp/run-model-cycle-logs/queue.log
+#
+# Each cycle: ~6-18h (launch server + 3 rollouts + audit + reroll + score).
+# A failed cycle (server boot timeout, model OOM, etc.) is logged and skipped;
+# the queue moves on to the next preset rather than blocking.
+#
+# Usage:
+#   ./evals/swebench/run_all_cycles.sh
+#   WAIT_FOR_PID=12345 ./evals/swebench/run_all_cycles.sh
+#   QUEUE="qwen36 gemma4" ./evals/swebench/run_all_cycles.sh
+#
+# Environment overrides:
+#   QUEUE          space-separated preset names (default: full bake-off queue)
+#   WAIT_FOR_PID   if set, wait for this PID to exit before starting the queue
+#   POLL_SECS      WAIT_FOR_PID poll interval in seconds (default: 60)
+#   SCAFFOLDS      lane list handed to every cycle (default: the cycle's own)
+#   SCAFFOLDS_FOR  per-preset lane override, "preset:lane,lane preset2:lane"
+#                  e.g. "qwen36-dense:opencode,little-coder devstral:opencode"
+#                  — presets not listed fall back to SCAFFOLDS / cycle default.
+#                  Used for the 256K re-roll of cells that ran at a scaffold
+#                  budget below the served window (2026-09-11).
+#
+# Detach pattern (recommended — survives session interrupts):
+#   mkdir -p /tmp/run-model-cycle-logs
+#   setsid bash -c './evals/swebench/run_all_cycles.sh \
+#       > /tmp/run-model-cycle-logs/queue.log 2>&1 \
+#       & echo $! > /tmp/run-model-cycle-logs/queue.pid; disown' \
+#       </dev/null >/dev/null 2>&1 & disown
+
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Default bake-off queue: coder-30b-eval first so a boot-time invocation
+# correctly resumes the in-flight cycle if the box rebooted mid-rollout
+# (kernel BUG ~9-17h uptime — see project_3090_kernel_bug_reboots memory).
+# Every cycle is idempotent via --skip-existing; replaying a finished
+# cycle is a ~45s no-op.
+# nemotron3-omni added 2026-06-20: it's an AVLM omni/reasoning ship (thinking +
+# tool-call), NOT coding-tuned — included to TEST whether the Mamba2-hybrid can
+# also code (don't assume it can't; prove it). Runs last; --skip-existing no-ops
+# the others so a restart after the 9-preset run only does nemotron.
+QUEUE="${QUEUE:-qwen38 coder-30b-eval qwen36 coder-reap-25b qwen36-ream qwen35-moe coder-30b-ream qwen36-dense devstral gemma4 nemotron3-omni}"
+POLL_SECS="${POLL_SECS:-60}"
+WAIT_FOR_PID="${WAIT_FOR_PID:-}"
+SCAFFOLDS_FOR="${SCAFFOLDS_FOR:-}"
+# SPEC_FOR="preset:1 preset:1" — cycles that serve with the preset's SPEC_DECODE
+# opt-in (v4 campaign, 2026-09-27: qwen38 on DSpark at the same 256K window;
+# every other preset stays no-spec until its opt-in is validated at 256K).
+# The value is exported verbatim as SPEC_DECODE for that cycle only.
+SPEC_FOR="${SPEC_FOR:-}"
+
+LOG_ROOT="/tmp/run-model-cycle-logs"
+mkdir -p "$LOG_ROOT"
+
+log() { echo "[run-all-cycles $(date +%F\ %H:%M:%S)] $*"; }
+
+# Single-instance lock so the systemd boot unit doesn't double-start when
+# a setsid'd queue is already running. The lock lives in /tmp (tmpfs, wiped
+# on reboot), so a fresh boot always proceeds.
+LOCKFILE="/tmp/swebench-bakeoff.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  log "another queue runner holds $LOCKFILE; exiting"
+  exit 0
+fi
+
+if [ -n "$WAIT_FOR_PID" ]; then
+  if kill -0 "$WAIT_FOR_PID" 2>/dev/null; then
+    log "waiting for pid $WAIT_FOR_PID to exit (poll=${POLL_SECS}s)"
+    while kill -0 "$WAIT_FOR_PID" 2>/dev/null; do
+      sleep "$POLL_SECS"
+    done
+    log "pid $WAIT_FOR_PID exited; starting queue"
+  else
+    log "pid $WAIT_FOR_PID already gone; starting queue immediately"
+  fi
+fi
+
+log "queue: $QUEUE${SPEC_FOR:+  spec: $SPEC_FOR}  run_tag: ${RUN_TAG:-<cycle default>}"
+QUEUE_START=$(date +%s)
+
+for PRESET in $QUEUE; do
+  CYCLE_START=$(date +%s)
+  LOG_DIR="$LOG_ROOT/$PRESET"
+  mkdir -p "$LOG_DIR"
+  WRAPPER_LOG="$LOG_DIR/wrapper.log"
+
+  LANES=""
+  for kv in $SCAFFOLDS_FOR; do
+    [ "${kv%%:*}" = "$PRESET" ] && LANES="${kv#*:}"
+  done
+  SPEC=""
+  for kv in $SPEC_FOR; do
+    [ "${kv%%:*}" = "$PRESET" ] && SPEC="${kv#*:}"
+  done
+  CYCLE_ENV=()
+  [ -n "$LANES" ] && CYCLE_ENV+=("SCAFFOLDS=${LANES//,/ }")
+  [ -n "$SPEC" ] && CYCLE_ENV+=("SPEC_DECODE=$SPEC")
+
+  log "=== START $PRESET${LANES:+ (lanes: ${LANES//,/ })}${SPEC:+ (SPEC_DECODE=$SPEC)} ==="
+  env "${CYCLE_ENV[@]}" bash "$REPO_DIR/evals/swebench/run_model_cycle.sh" "$PRESET" \
+    > "$WRAPPER_LOG" 2>&1
+  RC=$?
+  DURATION=$(( $(date +%s) - CYCLE_START ))
+
+  if [ "$RC" -eq 0 ]; then
+    log "=== DONE  $PRESET rc=$RC duration=$((DURATION/3600))h$((DURATION/60 % 60))m ==="
+  else
+    log "=== FAIL  $PRESET rc=$RC duration=$((DURATION/3600))h$((DURATION/60 % 60))m (continuing queue; log=$WRAPPER_LOG) ==="
+  fi
+done
+
+TOTAL=$(( $(date +%s) - QUEUE_START ))
+log "=== QUEUE COMPLETE total=$((TOTAL/3600))h$((TOTAL/60 % 60))m ==="

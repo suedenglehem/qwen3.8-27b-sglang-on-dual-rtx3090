@@ -1,0 +1,28 @@
+# Built / downloaded at install time by install.sh — never ship.
+# (gitignore: '#' starts a comment only at the beginning of a line — keep them on their own lines.)
+
+# sglang v0.5.20 source + 33 patches (cloned + patched by install.sh; carries a .git)
+sglang-rebase-v0520/
+# uv venv (python 3.12, torch cu130, ...) — rebuilt by install.sh (also self-ignores via its own .gitignore)
+v0520/
+# abandoned first venv (kept out in case it reappears)
+v312/
+# model checkpoints (int4 / fp8) — downloaded or predownloaded
+models/
+# sgl-kernel JIT cache (machine-specific, path-keyed)
+.cache/
+
+# Host-specific overrides — install.sh writes it; run_qwen38.sh sources it.
+config.env
+config.env.bak
+
+# Runtime artifacts (server logs, pids, resume markers).
+server-*
+*.pid
+.resume
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.pyc
