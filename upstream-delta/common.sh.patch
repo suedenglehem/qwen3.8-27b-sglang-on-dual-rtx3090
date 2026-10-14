@@ -1,0 +1,34 @@
+--- a/scripts/common.sh
++++ b/scripts/common.sh
+@@ -22,8 +22,15 @@
+     elif command -v conda &>/dev/null; then
+         CONDA_BASE="$(conda info --base 2>/dev/null)"
+     else
+-        echo "ERROR: Cannot find conda. Set CONDA_BASE=/path/to/conda"
+-        exit 1
++        # HOST ADAPTATION (/dd2/sglang): this machine has no conda — the serving env is a
++        # uv venv at /dd2/sglang/v0520, activated by run_qwen38.sh before launch. When a
++        # venv is already active we proceed without conda instead of aborting.
++        if [ -n "${VIRTUAL_ENV:-}" ]; then
++            export SGLANG_NO_CONDA=1
++        else
++            echo "ERROR: Cannot find conda. Set CONDA_BASE=/path/to/conda, or activate a venv (run_qwen38.sh)."
++            exit 1
++        fi
+     fi
+ fi
+ export CONDA_BASE
+@@ -40,10 +47,13 @@
+ BASE_URL="http://localhost:${PORT}"
+ 
+ init_conda() {
++    # HOST ADAPTATION (/dd2/sglang): no-op without conda — see the SGLANG_NO_CONDA guard above.
++    [ -n "${SGLANG_NO_CONDA:-}" ] && return 0
+     eval "$($CONDA_BASE/bin/conda shell.bash hook)"
+ }
+ 
+ activate_conda() {
++    [ -n "${SGLANG_NO_CONDA:-}" ] && return 0
+     init_conda
+     conda activate "$ENV_NAME"
+ }

@@ -1,21 +1,35 @@
-# Serving Qwen3.8 27b with sglang
+# Qwen3.8-27B on sglang — dual RTX 3090
 
-Serves **Qwen3.8-27B** on two NVIDIA GPUs (TP=2) with a patched **sglang v0.5.20** tree.
+Serves **Qwen3.8-27B** on two RTX 3090 (24 GB each) with a patched **sglang v0.5.20** tree.
 One entry point for everything: **`./run_qwen38.sh`**.
 
-Built on mattbucci's 2×3090 rig (URL in `url.txt`), adapted to a conda-free host (uv venv)
-and to Qwen3.8-27B. **`PROGRESS.md` is the knowledge base** — read it for the *why* (commit
-pin, venv recipe, memory model, GPU-mapping trap, template rule, measured numbers). This
-file is the *how*.
+Built on [mattbucci's 2×3090 sglang rig](https://github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference)
+(a pinned commit + a 3-file delta — see "Provenance" below), adapted to a conda-free host
+(uv venv) and to Qwen3.8-27B. **`PROGRESS.md` is the knowledge base** — read it for the
+*why* (commit pin, venv recipe, memory model, GPU-mapping trap, template rule, measured
+numbers). This file is the *how*.
+
+## Provenance: the upstream rig
+
+This deploy is [mattbucci's 2×3090 sglang inference rig](https://github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference)
+with three small additions. Rather than vendoring the whole rig, this repo stores just the
+delta (`upstream-delta/`) and `install.sh` clones the upstream at a pinned commit and applies
+it:
+
+- **Upstream:** <https://github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference> (also in `url.txt`)
+- **Pinned commit:** `9e533ae` — the exact commit the rig was built from; `upstream@9e533ae`
+  + the delta reproduces the running `repo/` tree byte-for-byte.
+- **The delta** (`upstream-delta/`): patches `066` (Anthropic effort passthrough) and `067`
+  (server-default sampling) plus a `common.sh` patch (the conda-free guard). Everything else —
+  patches `001`–`065`, `scripts/launch.sh`, docs — comes straight from upstream.
+
+See `upstream-delta/README.md` for the full provenance.
 
 ## Requirements
 
-- 2× NVIDIA GPUs (TP=2). **Dual RTX 3090 (24 GB) is the reference rig, not a hard
-  requirement** — it also runs on ~16 GB cards, verified on a mixed pair of an
-  **RTX 4080 SUPER + RTX 4060 Ti (both 16 GB, Ada / sm_89)**. Keep the two cards the
-  same size class (the launcher checks that they balance in memory).
-  - **INT4** fits on ~16 GB cards (weights ~8.8 GB/card; 140k context tested, KV pool ~215k).
-  - **FP8** costs ~2× the VRAM of INT4 and needs the 24 GB cards.
+- 2× NVIDIA RTX 3090 (24 GB) — the only validated config (TP=2). Keep the two cards
+  the same size class (the launcher checks that they balance in memory).
+  - **INT4** (AWQ) is the default variant; **FP8** costs ~2× the VRAM of INT4.
 - NVIDIA driver (recent; CUDA 13 runtime is pulled by the torch wheels, no toolkit needed)
 - Internet (clones sglang, builds the venv, downloads the model)
 - Disk: ~35 GB free for the FP8 variant (31 GB weights + venv + JIT cache), ~25 GB for INT4
@@ -30,18 +44,21 @@ cd qwen3.8-27b-sglang-on-dual-rtx3090
 ./run_qwen38.sh -fp8 -mtp # serve FP8 + MTP speculative decoding on port 8091
 ```
 
-`install.sh` clones + patches sglang, builds the venv, fetches the model (prompts for a
-predownloaded path or pulls from Hugging Face), writes `config.env`, and verifies the install.
-First boot after install compiles the JIT kernel cache (~12 min); subsequent boots are
-~55–70 s.
+`install.sh` clones the upstream rig + applies our delta, clones + patches sglang, builds the
+venv, fetches the model (prompts for a predownloaded path or pulls from Hugging Face), writes
+`config.env`, and verifies the install. First boot after install compiles the JIT kernel cache
+(~12 min); subsequent boots are ~55–70 s.
 
 ## Model variants
 
 | Flag | Checkpoint | Quant | KV pool (TP=2) | Notes |
 |---|---|---|---|---|
-| *(no flag)* or `-i4` | `hf-mattbucci/Qwen3.8-27B-AWQ` | awq_marlin (INT4) | ~697K tokens | the default; no MTP weights |
-| `-fp8` | `Qwen/Qwen3.8-27B-FP8` | fp8 (e4m3, dynamic act) | ~259K tokens | official Qwen release; **full VLM** (vision+video in the checkpoint) |
+| *(no flag)* or `-i4` | [hf-mattbucci/Qwen3.8-27B-AWQ](https://huggingface.co/hf-mattbucci/Qwen3.8-27B-AWQ) | awq_marlin (INT4) | ~697K tokens | the default; no MTP weights |
+| `-fp8` | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | fp8 (e4m3, dynamic act) | ~259K tokens | official Qwen release; **full VLM** (vision+video in the checkpoint) |
 | `-fp8 -mtp` | same as `-fp8` | fp8 + MTP draft | 165,532 tokens | ~2.5–3× decode speedup; FP8-only |
+
+Model sources (Hugging Face): INT4 → <https://huggingface.co/hf-mattbucci/Qwen3.8-27B-AWQ>,
+FP8 → <https://huggingface.co/Qwen/Qwen3.8-27B-FP8>.
 
 Same model (`qwen3_5`, `Qwen3_5ForConditionalGeneration`) in two quantizations. FP8 weights
 cost ~2× the VRAM of INT4, so its pool only just covers the 262144 context claim — deep
@@ -117,7 +134,8 @@ edited; see `PROGRESS.md` §6.
 | `install.sh` | installer (int4 \| fp8) |
 | `config.env` | host-specific paths (gitignored; written by `install.sh`) |
 | `templates/` | the chat template we serve |
-| `repo/` | the serving rig: `scripts/launch.sh` presets, `patches/` (33), docs |
+| `upstream-delta/` | the 3-file delta applied on top of the upstream rig (patches 066/067 + a `common.sh` patch) |
+| `repo/` | the serving rig: upstream mattbucci @ pinned commit + our delta (built by `install.sh`) |
 | `sglang-rebase-v0520/` | sglang v0.5.20 + patches (built by `install.sh`) |
 | `v0520/` | uv venv (built by `install.sh`) |
 | `models/` | downloaded weights (built by `install.sh`) |
@@ -126,6 +144,7 @@ edited; see `PROGRESS.md` §6.
 ## Further reading
 
 - `PROGRESS.md` — stack recipe, memory model, traps, measured numbers
-- `repo/patches/README.md` — per-patch narratives
+- `upstream-delta/README.md` — the upstream git, the pinned commit, and the 3-file delta
+- `repo/patches/README.md` — per-patch narratives (from the upstream rig, present after install)
 - `repo/CLAUDE.md`, `repo/rules-for-agents.md` — the upstream rig's rules (VRAM budget,
   launch rules, quantization)

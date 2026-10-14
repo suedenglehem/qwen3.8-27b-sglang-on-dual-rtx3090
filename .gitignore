@@ -1,6 +1,9 @@
 # Built / downloaded at install time by install.sh — never ship.
 # (gitignore: '#' starts a comment only at the beginning of a line — keep them on their own lines.)
 
+# The serving rig: upstream mattbucci rig @ a pinned commit + our 3-file delta (upstream-delta/).
+# Cloned + delta-applied by install.sh (step_rig); carries a .git. See upstream-delta/README.md.
+repo/
 # sglang v0.5.20 source + 33 patches (cloned + patched by install.sh; carries a .git)
 sglang-rebase-v0520/
 # uv venv (python 3.12, torch cu130, ...) — rebuilt by install.sh (also self-ignores via its own .gitignore)

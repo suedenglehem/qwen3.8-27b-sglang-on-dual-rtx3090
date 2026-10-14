@@ -2,10 +2,12 @@
 # install.sh — one-shot installer for the Qwen3.8-27B sglang serving stack.
 #
 # Builds, into the install root (default: this repo's directory):
-#   1. sglang v0.5.20 (pinned commit) + the 33 local patches (repo/patches/)
-#   2. a uv venv (python 3.12) with the exact pinned wheel set (torch cu130, etc.)
-#   3. the model checkpoint (int4 or fp8) — from a predownloaded path or Hugging Face
-#   4. config.env (host-specific paths; gitignored; written next to run_qwen38.sh)
+#   1. the serving rig (repo/): upstream mattbucci rig @ a pinned commit + our 3-file
+#      delta (upstream-delta/) — gives the 33 sglang patches + the launch scripts
+#   2. sglang v0.5.20 (pinned commit) + the 33 patches (repo/patches/)
+#   3. a uv venv (python 3.12) with the exact pinned wheel set (torch cu130, etc.)
+#   4. the model checkpoint (int4 or fp8) — from a predownloaded path or Hugging Face
+#   5. config.env (host-specific paths; gitignored; written next to run_qwen38.sh)
 # then verifies the install (venv import + DRY_RUN of the launcher).
 #
 # It does NOT start the server — that is `./run_qwen38.sh`.
@@ -29,6 +31,10 @@
 set -euo pipefail
 
 # ---------- constants ----------
+# The serving rig: upstream mattbucci rig @ a pinned commit, plus our 3-file delta.
+# See upstream-delta/README.md for the provenance and why the pin is 9e533ae (not main).
+RIG_URL="https://github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference"
+RIG_COMMIT="9e533aecc77bff8f8546824fcd2c12a1c370f45b"
 SGLANG_TAG="v0.5.20"
 SGLANG_COMMIT="94602c9c2b7cbdb8efd5c52802dac6a1c180089e"
 # Fingerprint of the fully-patched tree (33 patches on a pristine v0.5.20 clone).
@@ -36,7 +42,9 @@ EXPECTED_DIFF="38 files changed, 993 insertions(+), 113 deletions(-)"
 TORCH_INDEX="https://download.pytorch.org/whl/cu130"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH_DIR="$SCRIPT_DIR/repo/patches"
+RIG_DIR="$SCRIPT_DIR/repo"
+DELTA_DIR="$SCRIPT_DIR/upstream-delta"
+PATCH_DIR="$RIG_DIR/patches"
 RUN_SH="$SCRIPT_DIR/run_qwen38.sh"
 CONFIG_ENV="$SCRIPT_DIR/config.env"
 
@@ -122,7 +130,40 @@ step_prereqs() {
     if command -v uv >/dev/null 2>&1; then echo "  uv: $(uv --version)"; fi
 }
 
-# ---------- 2. sglang tree ----------
+# ---------- 2. serving rig (upstream + delta) ----------
+# Produces repo/ = upstream@RIG_COMMIT + our 3-file delta (the 33-patch rig).
+# Idempotent: a fresh machine clones; an existing clone is re-pinned and re-delta'd.
+step_rig() {
+    step "serving rig (upstream mattbucci @ ${RIG_COMMIT:0:7} + our delta)"
+    if [[ ! -d "$DELTA_DIR" ]]; then
+        die "delta dir missing: $DELTA_DIR (should hold 066/067 patches + common.sh.patch)"
+    fi
+    if [[ -d "$RIG_DIR/.git" ]]; then
+        # A proper clone — re-pin to the exact commit, then re-apply the delta below.
+        echo "  rig present at $RIG_DIR — re-pinning to ${RIG_COMMIT:0:7}."
+        run git -C "$RIG_DIR" reset --hard "$RIG_COMMIT"
+    elif [[ -f "$RIG_DIR/patches/066-anthropic-effort-passthrough.patch" && \
+           -f "$RIG_DIR/patches/067-server-default-sampling-params.patch" ]]; then
+        # Pre-restructure tracked repo/ (no .git) with the delta already applied — leave it.
+        echo "  rig present at $RIG_DIR (pre-restructure, delta applied) — leaving as-is."
+        return 0
+    else
+        # Fresh (no repo/) or an incomplete pre-restructure repo/ — rebuild from upstream.
+        if [[ -e "$RIG_DIR" ]]; then
+            echo "  $RIG_DIR exists but is incomplete — rebuilding from upstream."
+            run rm -rf "$RIG_DIR"
+        fi
+        run git clone "$RIG_URL" "$RIG_DIR"
+        run git -C "$RIG_DIR" reset --hard "$RIG_COMMIT"
+    fi
+    # Apply the delta (reached only for the clone / re-pin paths). 066/067 are new
+    # files; common.sh.patch re-applies after the reset.
+    run cp -f "$DELTA_DIR/066-anthropic-effort-passthrough.patch" \
+              "$DELTA_DIR/067-server-default-sampling-params.patch" "$RIG_DIR/patches/"
+    run git -C "$RIG_DIR" apply "$DELTA_DIR/common.sh.patch"
+}
+
+# ---------- 3. sglang tree ----------
 apply_patches() {
     local p
     shopt -s nullglob
@@ -178,7 +219,7 @@ step_sglang() {
     fi
 }
 
-# ---------- 3. venv ----------
+# ---------- 4. venv ----------
 step_venv() {
     step "venv (uv, python 3.12)"
     if [[ -x "$VENV_DIR/bin/python" ]]; then
@@ -210,7 +251,7 @@ step_venv() {
     fi
 }
 
-# ---------- 4. model ----------
+# ---------- 5. model ----------
 model_present() {
     # fast presence check: config.json + >=1 safetensors (no full read)
     local dir="$1"
@@ -317,7 +358,7 @@ step_model() {
     validate_model "$model_dir"
 }
 
-# ---------- 5. config.env ----------
+# ---------- 6. config.env ----------
 step_config() {
     step "config.env"
     local int4_dir="$MODELS_DIR/hf-mattbucci/Qwen3.8-27B-AWQ"
@@ -358,7 +399,7 @@ EOF
     fi
 }
 
-# ---------- 6. verify ----------
+# ---------- 7. verify ----------
 step_verify() {
     step "verify"
     if [[ "$DRY_RUN" == "1" ]]; then
@@ -391,6 +432,7 @@ main() {
     echo "  repo dir     : $SCRIPT_DIR"
     echo "  dry-run      : $DRY_RUN"
     step_prereqs
+    step_rig
     step_sglang
     step_venv
     step_model
