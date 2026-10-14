@@ -418,3 +418,11 @@ cache real-path fix, `--print-cmd`, and this deploy packaging.
   `upstream-delta/` + `install.sh`/`.gitignore`/`README.md`) and **pushed** to
   `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`. `run_i7.sh` (the
   i7 4080/4060ti helper) left untracked.
+- **2026-10-14 (README perf note)** — Added a measured-throughput note as the 3rd
+  paragraph of the README intro (before "## Provenance"): on the author's host (x399
+  motherboard / PCIe gen3, Threadripper 1950x, 64 GB DDR4-3600) the **FP8 (q8) variant
+  reaches ~80 tok/s — about 10 tok/s more than vLLM** on the same hardware and variant.
+  "q8" was read as the FP8 (8-bit) variant and written as "FP8 (q8)" to match the user's
+  term while staying consistent with the README's INT4/FP8 naming; flagged to the user in
+  case "q8" meant something else (e.g. a separate GGUF Q8_0). Committed `bf34908` and
+  **pushed** to `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`.
