@@ -56,14 +56,14 @@ VARIANT="int4"
 MODEL_DIR_ARG=""
 INSTALL_DIR=""
 DRY_RUN=0
-for a in "$@"; do
-    case "$a" in
-        int4|fp8)      VARIANT="$a" ;;
-        --model-dir)   shift; MODEL_DIR_ARG="${1:?--model-dir needs a path}" ;;
-        --install-dir) shift; INSTALL_DIR="${1:?--install-dir needs a path}" ;;
-        --dry-run)     DRY_RUN=1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        int4|fp8)      VARIANT="$1"; shift ;;
+        --model-dir)   shift; MODEL_DIR_ARG="${1:?--model-dir needs a path}"; shift ;;
+        --install-dir) shift; INSTALL_DIR="${1:?--install-dir needs a path}"; shift ;;
+        --dry-run)     DRY_RUN=1; shift ;;
         -h|--help)     usage; exit 0 ;;
-        *) echo "ERROR: unknown argument: $a" >&2; usage; exit 1 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage; exit 1 ;;
     esac
 done
 
@@ -373,8 +373,15 @@ for i in range(torch.cuda.device_count()):
     p = torch.cuda.get_device_properties(i)
     print(f"  cuda:{i}  {p.name}  {p.total_memory/2**30:.1f} GB")
 PY
+    # run_qwen38.sh flags are -i4 / -fp8 (not -int4 / -fp8-variant) — map the
+    # install variant onto the launcher's spelling.
+    local run_flag
+    case "$VARIANT" in
+        int4) run_flag="-i4" ;;
+        fp8)  run_flag="-fp8" ;;
+    esac
     echo "  launcher argv (DRY_RUN, $VARIANT):"
-    ( cd "$SCRIPT_DIR" && DRY_RUN=1 "$RUN_SH" "-$VARIANT" ) | sed 's/^/    /'
+    ( cd "$SCRIPT_DIR" && DRY_RUN=1 "$RUN_SH" "$run_flag" ) | sed 's/^/    /'
 }
 
 # ---------- main ----------

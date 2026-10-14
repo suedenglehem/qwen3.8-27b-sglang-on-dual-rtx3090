@@ -347,6 +347,58 @@ cache real-path fix, `--print-cmd`, and this deploy packaging.
   the chat template into `templates/` (md5-verified).
 - **2026-10-14** — Deploy packaging: this file + rewritten `README.md` + self-locating
   `run_qwen38.sh`/`config.env` + `install.sh` (int4|fp8). Cleaned test artifacts + stale
-  `v312/` venv (8.7 GB, unreferenced). Initialized the deploy git repo (no push yet —
-  push to `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git` happens after
-  the i7 test install succeeds).
+  `v312/` venv (8.7 GB, unreferenced).
+  - **`install.sh` verified (all on this host):** `fp8 --dry-run` + `int4 --dry-run` both
+    sane/complete. Fresh-clone replay in `/tmp` (clone @ pin + 33 strict patches) → shortstat
+    fingerprint exact (`38 files / 993+ / 113-`) and working tree **byte-identical** to the
+    live tree (only 2 diffs = gitignored editable-install artifacts the installer regenerates).
+    Model validators pass (fp8 crc32 66/66 clean, 3 known-stale non-weight; int4 dir =
+    config.json + single 18.7 GB `model.safetensors`). `run_qwen38.sh` argv gate: all 5 flag
+    combos byte-identical to baseline after the `VENV_DIR` edit. Live server (PID 10431,
+    :8091) untouched throughout.
+  - **Deploy git repo initialized (no push yet):** `repo/.git` stripped; `.gitignore` written
+    (fixed an inline-comment bug — gitignore `#` only comments at line start — that had staged
+    `sglang-rebase-v0520` as a gitlink; `v0520/` self-ignores via its own uv-written
+    `.gitignore`); initial commit `45169da` (914 files, 9.8 MB, nothing >100 MB, ends with the
+    `Co-Authored-By` line); remote `origin` added.
+  - **Next unfinished task:** user preps the i7 host (2× 24 GB GPUs, driver, internet,
+    ~35 GB free disk for fp8 / ~25 GB int4). Test-install there: copy the repo (or clone once
+    pushed) → `./install.sh fp8` (or `int4`) → `./run_qwen38.sh -fp8 -mtp` (or `./run_qwen38.sh`
+    for int4). **Then** push to `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`.
+- **2026-10-14 (i7 test install)** — Reproduced the stack on the user's i7 host
+  (`ssh andrei@i7` = `i714700k`) into `/dd2/sglang`, per the user's ask: fit **int4** onto the
+  i7's **2× ~16 GB** cards and launch at **140k context** ("it's a try, i won't cry if it
+  doesn't work" — the user runs llama-server q4 of this model at 256k, so 140k is a
+  conservative start for the heavier sglang stack).
+  - **i7 hardware:** 2× ~16 GB **Ada Lovelace (sm_89)** — `cuda:0` RTX 4080 SUPER (16376 MiB),
+    `cuda:1` RTX 4060 Ti (16380 MiB). 4 MiB gap → TP=2 memory-balance check passes. No third
+    card, so `CUDA_VISIBLE_DEVICES=0,1` is unambiguous (no display-card trap like the 3090
+    host). 28 cores, 62 GB RAM, /dd2 80 GB free. No system torch; `install.sh` auto-installed
+    uv 0.13.0 to `~/.local/bin`.
+  - **`install.sh int4` ran to completion** (3rd attempt). Model was **pre-existing** at
+    `/mnt/models_sas_ssd/lmstudio/Models/sglang/hf-mattbucci/Qwen3.8-27B-AWQ` (passed via
+    `--model-dir`, used in place, never moved). sglang clone @ pin + 33 strict patches
+    (fingerprint `38 files / 993+ / 113-` verified), venv built (torch 2.13.0+cu130, sglang
+    0.5.20), `config.env` written, verify passed (correct 2 CUDA devices + valid DRY_RUN argv).
+  - **Two `install.sh` bugs fixed** — both missed by the earlier `--dry-run`-only testing
+    (dry-runs never passed `--model-dir`, and the real verify step was never exercised):
+    1. **Arg parsing** — `for a in "$@"` + `shift` is broken: the `for` captures the full list
+       up front, so `shift` doesn't stop the loop from later visiting a `--model-dir` path as a
+       stray positional → `ERROR: unknown argument: /mnt/...`. Rewrote as the
+       `while [[ $# -gt 0 ]]; do case "$1" in ... shift ;; esac; done` idiom.
+    2. **`step_verify` variant name** — ran `run_qwen38.sh "-$VARIANT"` → `-int4`, but the
+       launcher only accepts `-i4`/`-fp8` → `Unknown option: -int4`. Now maps `int4→-i4`,
+       `fp8→-fp8`.
+  - **Launch (the "try"):** `./run_qwen38.sh -i4 --context-length 140000`. The qwen38 preset
+    hardcodes `CTX=262144` (not env-overridable), so the `--context-length` CLI flag — applied
+    *after* the preset in `launch.sh` — is the override (confirmed in the DRY_RUN argv). Memory
+    budget for 140k on 2× 16 GB: int4 weights ~9.4 GB/card + KV@140k ~2.2 GB/card (16
+    full-attn layers × 4 KV heads × 256 head_dim × 2 × 1 B fp8 = 32 KB/token) ≈ 11.6 GB/card
+    vs the `MEM=0.85` budget of 13.6 GB/card → ~2 GB headroom for CUDA graphs / mamba state /
+    activations. **It fit and booted.** Weights 8.80 GB/card, KV pool **215,536 tokens**
+    (K+V 3.28 GB/card, fp8), mamba 0.63 GB/card → ~2.4 GB free/card after pools; decode CUDA
+    graph captured, server healthy on :8091. Generation verified coherent ("capital of France"
+    → "Paris", `finish_reason: stop`). The 140k cap sits well under the 215k pool, so there is
+    headroom to raise `--context-length` toward ~215k if wanted.
+  - **Next unfinished task:** commit the 2 `install.sh` fixes + this entry, then **push** to
+    `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`.
