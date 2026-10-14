@@ -1,6 +1,6 @@
-# Qwen3.8-27B on sglang — dual RTX 3090
+# Serving Qwen3.8 27b with sglang
 
-Serves **Qwen3.8-27B** on two RTX 3090 (24 GB each) with a patched **sglang v0.5.20** tree.
+Serves **Qwen3.8-27B** on two NVIDIA GPUs (TP=2) with a patched **sglang v0.5.20** tree.
 One entry point for everything: **`./run_qwen38.sh`**.
 
 Built on mattbucci's 2×3090 rig (URL in `url.txt`), adapted to a conda-free host (uv venv)
@@ -10,7 +10,12 @@ file is the *how*.
 
 ## Requirements
 
-- 2× NVIDIA RTX 3090 (24 GB) — or any 2× 24 GB Ampere (sm_80) cards
+- 2× NVIDIA GPUs (TP=2). **Dual RTX 3090 (24 GB) is the reference rig, not a hard
+  requirement** — it also runs on ~16 GB cards, verified on a mixed pair of an
+  **RTX 4080 SUPER + RTX 4060 Ti (both 16 GB, Ada / sm_89)**. Keep the two cards the
+  same size class (the launcher checks that they balance in memory).
+  - **INT4** fits on ~16 GB cards (weights ~8.8 GB/card; 140k context tested, KV pool ~215k).
+  - **FP8** costs ~2× the VRAM of INT4 and needs the 24 GB cards.
 - NVIDIA driver (recent; CUDA 13 runtime is pulled by the torch wheels, no toolkit needed)
 - Internet (clones sglang, builds the venv, downloads the model)
 - Disk: ~35 GB free for the FP8 variant (31 GB weights + venv + JIT cache), ~25 GB for INT4
