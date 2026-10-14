@@ -2,9 +2,10 @@
 
 This is the durable knowledge base for this project: what the stack is, how it was built,
 the traps that cost hours, and the measured numbers. Read `README.md` for how to run it;
-read this for *why* it is shaped the way it is. Provenance: built on top of mattbucci's
-2×3090 rig (`url.txt` → github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference), adapted
-to this host (no conda, uv venv) and to serving Qwen3.8-27B specifically.
+read this for *why* it is shaped the way it is. Provenance: built on top of mattbucci's 2×3090 rig
+(`url.txt` → github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference), pinned at commit
+`9e533ae` + a 3-file delta (`upstream-delta/`), adapted to this host (no conda, uv venv) and
+to serving Qwen3.8-27B specifically.
 
 ---
 
@@ -33,25 +34,28 @@ One entry point: **`./run_qwen38.sh`**. It wraps `repo/scripts/launch.sh`'s `qwe
 ```
 README.md            # how to run (deploy guide)
 PROGRESS.md          # this file
-install.sh           # installs int4 | fp8 (clones+patches sglang, builds venv, fetches model)
+install.sh           # installs int4 | fp8 (clones rig + sglang, patches, builds venv, fetches model)
 run_qwen38.sh        # self-locating launcher; reads config.env for host-specific paths
 config.env           # host-specific paths (gitignored; install.sh writes it)
 url.txt              # provenance: mattbucci rig URL
 templates/qwen3.8.q6.sglang.jinja   # the chat template we serve (verbatim — see §6)
-repo/                # mattbucci rig, minus its .git (scripts/, patches/, docs, ...)
+upstream-delta/      # the 3-file delta on the upstream rig (patches 066/067 + common.sh.patch)
 ```
 
 **Built / downloaded at install time (git-excluded):**
 
 ```
-sglang-rebase-v0520/   # pristine sglang v0.5.20 clone + 33 local patches applied (206 MB)
+repo/                  # the serving rig: upstream mattbucci @ 9e533ae + our delta (cloned + delta-applied by install.sh)
+sglang-rebase-v0520/   # pristine sglang v0.5.20 clone + 33 patches applied (206 MB)
 v0520/                 # uv venv, python 3.12.3 (8.6 GB)
 models/                # downloaded model weights (int4 ~20 GB / fp8 ~31 GB)
 .cache/sglang/jit/     # JIT kernel cache (path-keyed → machine-specific, never shipped)
 ```
 
-`repo/` is the only large *shipped* directory (14 MB). Everything else is rebuilt by
-`install.sh`, so a fresh clone + `./install.sh fp8` reproduces the whole stack.
+The only *shipped* content is the small `upstream-delta/` (3 patches + a README) plus the
+top-level scripts and docs. `install.sh` clones the upstream rig at a pinned commit and
+applies the delta to rebuild `repo/`, then clones + patches sglang, builds the venv, and
+fetches the model — so a fresh clone + `./install.sh fp8` reproduces the whole stack.
 
 ---
 
@@ -63,9 +67,11 @@ models/                # downloaded model weights (int4 ~20 GB / fp8 ~31 GB)
 - Tag: **`v0.5.20`** = commit **`94602c9c2b7cbdb8efd5c52802dac6a1c180089e`** (verified
   `git tag --points-at HEAD` = `v0.5.20`).
 - The live tree = **pristine clone @ v0.5.20 + the 33 patches in `repo/patches/*.patch`**
-  applied in glob order via `git apply`. Result: **38 files changed, 993 insertions(+),
-  113 deletions(-), 0 untracked**. This was verified byte-identical to the live tree by
-  mattbucci's 3-gate pristine replay (see `repo/patches/README.md`).
+  applied in glob order via `git apply`. All but **066/067** come straight from the upstream
+  rig; **066/067 come from our delta** (`upstream-delta/`, applied by `install.sh` `step_rig`).
+  Result: **38 files changed, 993 insertions(+), 113 deletions(-), 0 untracked**. This was
+  verified byte-identical to the live tree by mattbucci's 3-gate pristine replay (see
+  `repo/patches/README.md`).
 - 33 `.patch` files = 31 logical units (a couple of patches split a single logical change).
   `install.sh` applies them **strictly** on a fresh clone: any `git apply --check` failure
   aborts (a silent skip on a pristine clone can only mean a broken chain).
@@ -402,3 +408,13 @@ cache real-path fix, `--print-cmd`, and this deploy packaging.
     headroom to raise `--context-length` toward ~215k if wanted.
   - **Next unfinished task:** commit the 2 `install.sh` fixes + this entry, then **push** to
     `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`.
+- **2026-10-14 (repo/ restructure + push)** — Dropped `repo/` from git; the deploy now
+  ships only the 3-file delta (`upstream-delta/`: patches 066/067 + `common.sh.patch` + a
+  README) and `install.sh` clones the upstream rig at pinned `9e533ae` and applies the
+  delta (`step_rig`). Verified `upstream@9e533ae` + delta reproduces the live `repo/` tree
+  byte-for-byte (full `diff -r`). README: added a Provenance section; restored the
+  dual-3090 framing (the 4080 SUPER + 4060 Ti ~16 GB Ada config is buggy, so dual RTX 3090
+  is the only validated config). Committed `77fee1c` (912 files: 907 `repo/` removals +
+  `upstream-delta/` + `install.sh`/`.gitignore`/`README.md`) and **pushed** to
+  `git@github.com:suedenglehem/qwen3.8-27b-sglang-on-dual-rtx3090.git`. `run_i7.sh` (the
+  i7 4080/4060ti helper) left untracked.
