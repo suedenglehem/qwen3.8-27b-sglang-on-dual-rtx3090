@@ -9,6 +9,10 @@ Built on [mattbucci's 2×3090 sglang rig](https://github.com/mattbucci/2x-3090-G
 *why* (commit pin, venv recipe, memory model, GPU-mapping trap, template rule, measured
 numbers). This file is the *how*.
 
+On the author's host (x399 motherboard / PCIe gen3, Threadripper 1950x, 64 GB DDR4-3600),
+the **FP8 (q8) variant reaches ~80 tok/s** — about **10 tok/s more than vLLM** on the same
+hardware and variant.
+
 ## Provenance: the upstream rig
 
 This deploy is [mattbucci's 2×3090 sglang inference rig](https://github.com/mattbucci/2x-3090-GA102-300-A1-sglang-inference)
